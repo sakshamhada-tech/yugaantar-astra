@@ -170,6 +170,13 @@ machine, so no real network partition was tested. Full list in
 Tested on Linux x86_64 with CPython 3.11 and 3.12; the judging runtime is
 Python 3.12. Nothing below needs network access at run time, only at install time.
 
+**On macOS:** one check in `scripts/phase1_acceptance.py` needs `unshare`, which is
+Linux-only. On a Mac it reports **SKIP** with the reason, not FAIL and not PASS — a
+missing capability is not a security finding, and calling it a failure would teach you
+to ignore failures. Everything else runs normally. To verify the container contract on
+a Mac, use `docker run --rm --read-only --tmpfs /tmp <image>`; see
+`docs/PLATFORM_SUPPORT.md`.
+
 ```sh
 git clone <this repo> && cd yugaantar-astra
 

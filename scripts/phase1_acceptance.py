@@ -101,6 +101,13 @@ def gate_container_contract(toolkit: Path | None) -> None:
         return
     cmd = [str(script)] + ([str(toolkit)] if toolkit else [])
     done = run(cmd, ROOT)
+    # Exit 77 means the check could not run on this host -- `unshare` is Linux-only.
+    # That is a SKIP, not a FAIL: reporting FAIL for a missing capability trains the
+    # reader to ignore failures, which is how a real one gets missed later.
+    if done.returncode == 77:
+        record("SKIP", "read-only rootfs + temp-only state",
+               "unshare unavailable on this host (Linux-only check)")
+        return
     ok = done.returncode == 0 and "all container-contract checks passed" in done.stdout
     record("PASS" if ok else "FAIL", "read-only rootfs + temp-only state",
            "code dir ro, state in temp, suite green" if ok else done.stderr.strip()[-120:] or "failed")

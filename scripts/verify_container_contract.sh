@@ -22,6 +22,20 @@ WORK="$(mktemp -d)"
 VENV="$WORK/venv"
 SRC="$WORK/app"
 
+# The read-only-mount checks need `unshare`, which is Linux-only. On macOS (or any
+# host without it) these checks CANNOT RUN. That is a missing capability, not a
+# security failure, so we say so loudly and exit 77 (the skip convention) rather
+# than pretending to have verified something we did not, or failing the whole gate.
+if ! command -v unshare >/dev/null 2>&1; then
+  echo
+  echo "== SKIPPED: read-only rootfs + temp-only state =="
+  echo "   'unshare' is not available on this host (it is Linux-only)."
+  echo "   Container contract NOT verified here. Do not read this as green."
+  echo "   To verify it: run this script on Linux, or use"
+  echo "   docker run --rm --read-only --tmpfs /tmp <image>"
+  exit 77
+fi
+
 echo "== 1. interpreter =="
 "$PYTHON" -V
 

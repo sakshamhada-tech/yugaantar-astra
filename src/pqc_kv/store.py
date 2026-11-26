@@ -32,6 +32,7 @@ from pathlib import Path
 
 from . import envelope
 from .aead import NonceBudget
+from . import intent
 from .keyring import ACTIVE, KeyRing, KeyRingError
 from .keystore import KeyStore, ensure_private_dir, write_key_file, read_key_file
 
@@ -390,40 +391,55 @@ class StateStore:
     def rotate(self, request: dict | None = None) -> dict:
         """Create key version N+1 and re-protect every asset under it.
 
-        Ordering matters and is the reason an interrupted rotation is recoverable:
+        Crash safety (goal 3): the whole operation is wrapped in a write-ahead intent
+        record. See ``pqc_kv/intent.py`` for the ordering and the recovery rule. In
+        short:
 
-            1. create version N+1 (active) -- new writes already have a home
-            2. re-wrap every asset, one at a time: open with the version recorded on
-               the asset, re-seal with N+1, update the index entry
-            3. only then mark N as *retiring* with its grace budget
+            intent -> re-wrap -> commit -> clear
 
-        Doing (3) last means a crash before step 2 finishes leaves N still active and
-        every asset still readable under whichever version its index entry names. No
-        asset is ever written with a version that does not exist yet, and no version
-        is retired before its data has moved.
-
-        This deliberately does **not** call ``setup()``: nothing here clears the
-        audit log, re-creates keys from scratch, or resets policy. A test asserts the
-        setup-only destructive hooks are never invoked.
+        An interruption at any point leaves exactly one reachable outcome, and
+        :meth:`recover` finishes it. This deliberately does **not** call ``setup()``:
+        nothing here clears the audit log, re-creates keys from scratch, or resets
+        policy. A test asserts the setup-only destructive hooks are never invoked.
         """
         request = request or {}
         grace = int(request.get("grace", 2))
-        # Allow a re-run to finish an interrupted rotation before starting a new one.
+
+        # Finish anything a previous crash left behind before starting new work.
         self.recover()
         with self._locked():
             state = self._read_state()
             before = state.get("active_version", 1)
+
+            intent.fault_point("before_intent")
+            intent.write_intent(self.root, {
+                "op": "rotate",
+                "from_version": before,
+                "to_version": before + 1,
+                "grace": grace,
+                "assets": sorted(state["assets"]),
+            })
+            intent.fault_point("after_intent")
+
             old_entry, new_entry = self.ring.rotate(grace=grace)
             ring_kem = self.ring.kem_pair(new_entry.version)
             ring_dsa = self.ring.dsa_pair(new_entry.version)
 
             resealed = 0
-            for asset, entry in list(state["assets"].items()):
+            total = len(state["assets"])
+            for index, (asset, entry) in enumerate(list(state["assets"].items())):
                 body = self._open_asset(asset, entry)
                 state["assets"][asset] = self._seal_asset(
                     asset, body, ring_kem, ring_dsa, version=new_entry.version
                 )
                 resealed += 1
+                # Persist progress so a crash mid-way leaves a partial state that
+                # recovery can finish, rather than a ring pointing at keys no asset
+                # has been sealed with yet.
+                state["active_version"] = new_entry.version
+                self._write_state(state)
+                if index == total // 2:
+                    intent.fault_point("mid_rewrap")
 
             state["active_version"] = new_entry.version
             self._append_audit(state, {
@@ -435,7 +451,13 @@ class StateStore:
                 "rule": f"key_v{before}_to_v{new_entry.version}",
                 "ts": _now(),
             })
+            intent.fault_point("before_commit")
             self._write_state(state)
+            intent.write_commit(self.root, {
+                "op": "rotate", "to_version": new_entry.version, "resealed": resealed,
+            })
+            intent.fault_point("after_commit")
+            intent.clear(self.root)
         return {
             "active_version": new_entry.version,
             "retiring_version": old_entry.version,
@@ -524,8 +546,82 @@ class StateStore:
         return False
 
     def recover(self) -> dict:
-        """Placeholder until goal 3 adds the intent log. Returns a no-op report."""
-        return {"recovered": False, "active_version": self._read_state().get("active_version", 1)}
+        """Bring state back to one consistent version after an interruption.
+
+        Called at the start of every rotation, and by the ``recover`` op. Rules (see
+        ``pqc_kv/intent.py``):
+
+            no intent            -> nothing to do
+            intent + commit      -> the rotation finished; clear the marker
+            intent, no commit    -> finish forward: re-wrap whatever is still on the
+                                    old version, then commit
+
+        "Finish forward" is safe because re-sealing is idempotent and every asset
+        carries the version that actually sealed it. Revocations are never touched:
+        they live in ``state["disabled"]``, which the intent record does not include.
+        """
+        record = intent.read_intent(self.root)
+        if record is None:
+            # A stray commit marker with no intent is a finished rotation whose
+            # cleanup was interrupted. Clearing it is correct and loses nothing.
+            intent.clear(self.root)
+            return {
+                "recovered": False,
+                "active_version": self._read_state().get("active_version", 1),
+            }
+
+        committed = intent.read_commit(self.root)
+        with self._locked():
+            state = self._read_state()
+            if committed is not None:
+                intent.clear(self.root)
+                return {
+                    "recovered": True,
+                    "action": "cleared",
+                    "active_version": state.get("active_version", 1),
+                }
+
+            target = int(record.get("to_version", state.get("active_version", 1)))
+            ring = self.ring.load()
+            try:
+                entry = self.ring.by_version(ring, target)
+            except KeyRingError:
+                # The intent names a version that was never created: nothing was
+                # re-sealed either, so the old version is still the truth.
+                intent.clear(self.root)
+                return {
+                    "recovered": True,
+                    "action": "abandoned",
+                    "active_version": state.get("active_version", 1),
+                }
+
+            ring_kem = self.ring.kem_pair(entry.version)
+            ring_dsa = self.ring.dsa_pair(entry.version)
+            completed = 0
+            for asset, asset_entry in list(state["assets"].items()):
+                if asset_entry.get("key_version") == entry.version:
+                    continue
+                body = self._open_asset(asset, asset_entry)
+                state["assets"][asset] = self._seal_asset(
+                    asset, body, ring_kem, ring_dsa, version=entry.version
+                )
+                completed += 1
+            state["active_version"] = entry.version
+            self._append_audit(state, {
+                "op": "recover", "actor": "", "request_id": "", "asset": "",
+                "decision": "recover", "rule": f"completed_to_v{entry.version}", "ts": _now(),
+            })
+            self._write_state(state)
+            intent.write_commit(self.root, {
+                "op": "recover", "to_version": entry.version, "resealed": completed,
+            })
+            intent.clear(self.root)
+        return {
+            "recovered": True,
+            "action": "completed",
+            "active_version": entry.version,
+            "resealed": completed,
+        }
 
     def is_revoked(self, actor: str) -> bool:
         """Public read-only query: is this actor disabled?

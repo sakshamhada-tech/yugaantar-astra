@@ -35,15 +35,23 @@ _SRC = Path(__file__).resolve().parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from pqc_kv import intent  # noqa: E402
 from pqc_kv.deps import BACKEND  # noqa: E402
 from pqc_kv.keystore import default_state_dir  # noqa: E402
 from pqc_kv.store import StateStore, StoreError  # noqa: E402
+
+# --- test-only fault injection, defused at import -----------------------------
+# TRACK4_FAULT_AT is a crash-injection hook used by the Phase 3 recovery tests. It is
+# read here, ONCE, from the environment, and then deleted from os.environ so that
+# nothing downstream -- including a future bug -- can set it from a request payload.
+# Only the five documented point names switch it on; anything else is ignored.
+_FAULT_POINT_ACTIVE = intent.take_fault_configuration()
 
 SUPPORTED_OPS = {"setup", "read", "revoke", "audit", "protected_read"}
 # Phase 3: key lifecycle and log integrity. Additions, like the messaging ops: the
 # contract explicitly says the twelve goals include capabilities outside its
 # protected-resource interface.
-KEY_OPS = {"rotate", "key_status", "log_verify", "log_head",
+KEY_OPS = {"rotate", "key_status", "log_verify", "log_head", "recover",
            "cluster_publish", "cluster_sync", "cluster_status"}
 # Phase 2: messaging operations are additions to, not replacements for, the five
 # contract operations. The adapter contract says the twelve goals include
@@ -199,7 +207,12 @@ def _dispatch_keys(request: dict) -> dict:
                 return {"error": "malformed_request"}
             return store.rotate({"grace": grace})
         if op == "key_status":
-            return store.key_status()
+            status = store.key_status()
+            # Deliberately reports *that* the hook is armed, never its value.
+            status["fault_injection_active"] = bool(_FAULT_POINT_ACTIVE)
+            return status
+        if op == "recover":
+            return store.recover()
         if op == "log_verify":
             ok, records = store.verify_audit_chain()
             return {"ok": ok, "records": records}

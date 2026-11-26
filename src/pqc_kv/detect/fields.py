@@ -62,6 +62,12 @@ class Reason:
     EMPTY_LINE = "empty_line"
     LINE_TOO_LONG = "line_too_long"
     BAD_COLUMN_COUNT = "bad_column_count"
+    #: The header row itself is unusable: wrong names, or the right names in a file
+    #: with no header at all. Kept separate from ``bad_column_count`` because the two
+    #: need different fixes -- one is a bad *record*, the other is a bad *export* --
+    #: and because a missing header aborts the whole file, which the operator has to
+    #: be able to tell apart from "one row was skipped".
+    BAD_HEADER = "bad_header"
     BAD_FIELD = "bad_field"
     BAD_TIMESTAMP = "bad_timestamp"
     BAD_OFFSET = "bad_offset"

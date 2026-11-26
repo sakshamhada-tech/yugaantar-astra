@@ -187,10 +187,37 @@ New adapter ops, all additive — `track4_service.py` is still byte-identical:
 `TRACK4_STATE_DIR`), `detect_status`. High-severity findings are also written into the
 Phase 3 **signed** key-event log, so a detection becomes tamper-evident.
 
-### Run the evaluation on a clean machine
+### Is Phase 4 complete? Run the acceptance gate
+
+```sh
+python scripts/phase4_acceptance.py
+```
+
+Drives `track4_service.py` as **real subprocesses** and prints PASS/FAIL per goal.
+Last full run: **29 passed, 0 failed.** Exit code is non-zero if anything fails, so it
+can be used as a gate. What it checks:
+
+| Group | Checks |
+| --- | --- |
+| goal 6 | unapproved change reported; approved one quiet; wrong-role ticket refused; self-approval refused; every alert explains itself; two different failures name two different missing facts |
+| goal 7 | a 3-hop chain over **valid** credentials is reported; the alert records the path, not a count |
+| goal 8 | an event on its validity boundary answers `uncertain` and names **both** possible orders; the same change well inside the window is settled and quiet |
+| determinism | two separate processes produce byte-identical reports; no timestamp in the report |
+| hostile input | 6 hostile values quarantined; none echoed; a broken approvals file is *named*, not silently treated as "no change control" |
+| persistence | `detect_append` persists a baseline; a second process reads it back; `detect_status` states the timing range |
+| contract | unknown op → `unsupported_operation`; `detect_log` with no log → `malformed_request` |
+| signed log | high-severity findings land in the Phase 3 signed log and the chain still verifies |
+| config | a different `min_novel_edges` changes the result, so the number is really read; a negative one is refused |
+
+It checks behaviour and contract, **not accuracy** — accuracy is a claim about a corpus,
+so it lives in the evaluation below. The gate caught a deliberately broken role check
+when I tested it (27/29, exit 1), so it is not passing vacuously.
+
+### Run the tests and the evaluation on a clean machine
 
 ```sh
 python -m pytest -q                              # whole suite
+python -m pytest tests/test_phase4_*.py -q       # Phase 4 only: 286 tests
 python scripts/phase4_eval.py --practice /path/to/Track-4-Toolkit/practice
 python scripts/phase4_synth.py --out /tmp/synth  # MESSY synthetic log, fixed seed
 python scripts/phase4_eval.py --synthetic /tmp/synth

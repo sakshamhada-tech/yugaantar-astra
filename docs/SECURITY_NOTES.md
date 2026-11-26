@@ -1033,6 +1033,9 @@ the detector a baseline from a period it believes clean.
 * Rejection samples are capped at 20, so a fully hostile log cannot make the *report*
   unbounded either. Verified with a 20 000-row garbage log: 20 000 rejected, 20 samples,
   48 ms.
+* A file whose header row is missing or foreign is refused as `bad_header` and parsing
+  stops immediately, rather than rejecting every subsequent line one by one against
+  columns that were never declared. Fail-closed, and the reason names the file.
 * A single over-length line is refused before it is split (`line_too_long`, measured
   0.3 ms for a 10 KB line), and impossible timestamps are refused per field.
 * An approvals file that cannot be read leaves detection running but is reported as

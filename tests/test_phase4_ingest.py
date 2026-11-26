@@ -87,7 +87,28 @@ def test_column_order_may_differ_but_column_set_may_not():
 def test_a_foreign_schema_is_refused_not_misparsed():
     result = parse_csv("a,b,c\n1,2,3\n", config=DetectorConfig())
     assert result.events == []
-    assert result.rejected[F.Reason.BAD_COLUMN_COUNT] >= 1
+    # `bad_header`, not `bad_column_count`: the file is the problem, not a record.
+    assert result.rejected[F.Reason.BAD_HEADER] == 1
+    assert F.Reason.BAD_COLUMN_COUNT not in result.rejected
+
+
+def test_a_missing_header_is_a_header_error_not_a_data_error():
+    """A headerless export must not look like one bad row.
+
+    Found while writing the Phase 4 acceptance gate: a log whose first line was data
+    came back as `bad_column_count` on line 1 with zero events, which reads like a
+    malformed record rather than "this file has no header". The fix names the file.
+    """
+    line = (
+        "b-0,2026-01-15T09:00:00.000Z,2026-01-15T09:00:00.100Z,0,user-a,gateway,"
+        "index,read,reader,reader,allow,,s-1,c-1"
+    )
+    result = parse_csv(line + "\n" + line + "\n", config=DetectorConfig())
+    assert result.events == []
+    assert result.rejected == {F.Reason.BAD_HEADER: 1}
+    # Fail closed, and stop rather than reject every remaining line against columns
+    # that were never declared.
+    assert result.total_lines_seen == 1
 
 
 # --------------------------------------------------------------- hostile fields

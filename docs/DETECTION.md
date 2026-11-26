@@ -254,6 +254,12 @@ accepted verbatim or the **whole event is quarantined** with a counted reason.
 
 * Charset is narrow printable ASCII, 96 characters for identities/services, 64 for event
   ids, 64 KB per line, 1 M events per request.
+* A file with no header row, or a foreign one, is refused as `bad_header` and parsing
+  stops there. It is a distinct token from `bad_column_count` because the two need
+  different fixes — one is a bad *record*, the other is a bad *export* — and because a
+  missing header aborts the whole file. Without the distinction a headerless log
+  reported "line 1: bad_column_count, 0 events accepted", which reads like one
+  malformed row instead of a file the detector could not interpret at all.
 * Non-ASCII is refused outright — Cyrillic `а` versus Latin `a` is the classic
   look-alike, and refusing beats guessing.
 * Leading/trailing/doubled spaces are refused (`"user-alex "` vs `"user-alex"`).

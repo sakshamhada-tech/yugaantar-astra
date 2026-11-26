@@ -157,14 +157,21 @@ def parse_csv(
             # Header row. We accept the declared columns in *any* order (a
             # re-ordered export is still valid data) but refuse a different set of
             # columns loudly, rather than mis-parsing a foreign schema.
+            #
+            # The whole file stops here, because every following line would otherwise
+            # be rejected one by one against columns that do not describe it -- a
+            # million useless rejections instead of one true reason. Reported as
+            # `bad_header`, not `bad_column_count`: a file with no header at all
+            # reaches this branch too, and "row 42 had the wrong number of columns"
+            # would send an operator looking at the data when the export is at fault.
             body_started = True
             try:
                 names = tuple(_split_row(line))
             except F.FieldError:
-                result.reject(line_number, F.Reason.BAD_COLUMN_COUNT)
+                result.reject(line_number, F.Reason.BAD_HEADER)
                 return result
             if set(names) != set(columns) or len(names) != len(columns):
-                result.reject(line_number, F.Reason.BAD_COLUMN_COUNT)
+                result.reject(line_number, F.Reason.BAD_HEADER)
                 return result
             columns = names
             result.header = columns

@@ -37,7 +37,7 @@ if str(_SRC) not in sys.path:
 
 from pqc_kv import intent  # noqa: E402
 from pqc_kv.deps import BACKEND  # noqa: E402
-from pqc_kv.keystore import default_state_dir  # noqa: E402
+from pqc_kv.keystore import KeyStoreError, default_state_dir  # noqa: E402
 from pqc_kv.store import StateStore, StoreError  # noqa: E402
 
 # --- test-only fault injection, defused at import -----------------------------
@@ -110,6 +110,13 @@ def dispatch(request: dict) -> dict:
         return _handle_protected_read(store, request)
     except StoreError:
         # Opaque: no paths, no state names, no exception text.
+        return {"error": "request_failed"}
+    except KeyStoreError:
+        # Key-file and state-directory failures live in a *different* exception
+        # hierarchy from StoreError, so they need naming here or they escape to
+        # track4_service.py and kill the process (exit 1, no JSON at all). Found by
+        # replacing the state directory with a regular file: every KV op crashed.
+        # A damaged state directory is a refusal, not a crash.
         return {"error": "request_failed"}
     except (KeyError, TypeError, ValueError):
         return {"error": "malformed_request"}

@@ -304,6 +304,56 @@ Both are recorded because they were the kind that produce a false PASS:
   reported 17/17. It now requires the specific reason, and deleting the check drops it
   to 15/17. A gate that accepts any failure measures nothing.
 
+## 1f. Phase 6 — red team: we attacked our own adapter first
+
+The live security assessment attacks this system. Rather than wait for that, the
+attacks are written down and run as a gate:
+
+```sh
+python scripts/redteam.py      # 23/23 attacks held
+```
+
+Every check is an attack that **succeeded against an earlier build** or is a standard
+attack on a system of this shape. Three succeeded and are now fixed:
+
+| # | Severity | Attack | Before | After |
+| --- | --- | --- | --- | --- |
+| F1 | **high** | delete / empty / truncate / corrupt an asset file, then read it | `exit 1`, **empty stdout** — a protocol violation, on four separate corruptions | `{"decision": "deny"}` |
+| F1b | high | corrupt `keyring.json`; replace the state directory with a file | crash on `read`; crash on **every** KV operation | refusal, opaque |
+| F2 | low–med | `ls -l` | `audit.jsonl` at **0644** while the ciphertext was 0600 — a recon map of who was denied what | every state file 0600, asserted by walking the tree |
+
+**F1's root cause is worth stating** because it is the kind of bug that reads as harmless
+and is not: the project has two sibling exception hierarchies, `StoreError` and
+`KeyStoreError`, and neither subclasses the other. Any path that reads key material can
+raise an exception the store's handlers do not catch, so the process exits 1 with nothing
+on stdout. Three separate sites did this.
+
+After the fix, a sweep of **12 disk corruptions × 12 operations = 144 combinations**
+produces zero crashes (`redteam.py` covers the same ground as a standing gate).
+
+### The one attack that still works, stated plainly
+
+**Rewriting `state.json` grants access.** Change `owners.brief` from `maya` to `ravi`
+and `ravi` reads the asset. The envelope still cannot be forged — the AAD binds it and
+the GCM tag fails — but *the policy that decides who may open it lives beside the keys
+that open it*. This is the trust boundary, the same one as in every earlier phase, and
+`redteam.py` prints it as a statement rather than a failure so there is no pretence it
+was fixed. Mitigation is deployment: state directory owned by the service user, `0700`,
+on a host the attacker does not already control. Under the organizer's sandbox the state
+directory is fresh per run.
+
+### What is explicitly out of scope
+
+Root or code execution as the service user · a modified interpreter or injected package ·
+sub-millisecond side channels across a process boundary (measured: a deny for an existing
+asset is 1.2× an unknown one *in-process*, and ~75 ms of process startup dominates the
+real request) · JSON nested past the interpreter's recursion limit, which the
+organizer's own `json.loads` refuses before our code runs · DoS by message volume, which
+the sandbox prohibits by policy and the wire format bounds at 67 107 840 bytes.
+
+Full detail, including the attacks that held and the residual gaps of the fix, is in
+`docs/SECURITY_NOTES.md` §P6-1…P6-4.
+
 ## 2. Clean-machine setup (tested)
 
 Tested on Linux x86_64 with CPython 3.11 and 3.12; the judging runtime is

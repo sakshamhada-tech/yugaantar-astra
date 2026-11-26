@@ -35,7 +35,8 @@ from .aead import NonceBudget
 from . import intent
 from .keyring import ACTIVE, KeyRing, KeyRingError
 from .keystore import (
-    KeyStore, b64d, b64e, ensure_private_dir, read_key_file, write_key_file,
+    KeyStore, KeyStoreError, b64d, b64e, ensure_private_dir, read_key_file,
+    write_key_file,
 )
 
 SCHEMA = 1
@@ -179,7 +180,14 @@ class StateStore:
                     stale.unlink()
                 except OSError:
                     pass
-            self.audit_path.write_bytes(b"")
+            # Truncate without re-creating: `write_bytes` opens 0644, which is how the
+            # audit log kept its world-readable mode across every setup.
+            fd = os.open(self.audit_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.close(fd)
+            try:
+                os.chmod(self.audit_path, 0o600)
+            except OSError:
+                pass
             try:
                 self._sealed_material_path.unlink()
             except FileNotFoundError:
@@ -282,7 +290,15 @@ class StateStore:
         version = int(entry.get("key_version", 1))
         recipient = self.ring.kem_pair(version)
         signer = self.ring.dsa_pair(version)
-        record = read_key_file(self.assets_dir / entry["file"])
+        # `read_key_file` raises KeyStoreError, which is NOT a StoreError: the two
+        # are separate hierarchies. Without this wrapper a deleted, empty or
+        # truncated asset file escaped every handler in team_app and killed the
+        # process (exit 1, no JSON) instead of producing a deny. Found by deleting
+        # the file on disk and reading it back.
+        try:
+            record = read_key_file(self.assets_dir / entry["file"])
+        except KeyStoreError:
+            raise StoreError("stored envelope missing or unreadable") from None
         try:
             env = envelope.from_dict(json.loads(record["envelope"]))
         except (KeyError, TypeError, ValueError):
@@ -353,8 +369,11 @@ class StateStore:
         N before rotation happened. That is the only kind of request the cutoff can
         meaningfully affect, and it is the case tested end to end.
         """
-        ring = self.ring.load()
+        # `load()` itself raises KeyRingError on a corrupt ring, and it was called
+        # outside this try -- so a damaged keyring.json killed the process instead of
+        # refusing the request. Both calls belong inside the guard.
         try:
+            ring = self.ring.load()
             entry = self.ring.by_version(ring, version)
         except KeyRingError:
             return False
@@ -378,8 +397,10 @@ class StateStore:
             return "deny", "owner_required", None
         try:
             body = self._open_asset(asset, state["assets"][asset])
-        except StoreError:
+        except (StoreError, KeyStoreError):
             # Fail closed: a corrupt/tampered asset is a denial, never a fallback.
+            # KeyStoreError is listed explicitly because key-file reading lives in a
+            # different exception hierarchy and a missed wrapper must still deny.
             return "deny", "asset_integrity_failure", None
         return "allow", "owner_allowed", body
 
@@ -870,10 +891,25 @@ class StateStore:
         record = dict(record, seq=seq, prev=prev)
         digest = _digest(json.dumps(record, sort_keys=True, separators=(",", ":")))
         line = json.dumps(dict(record, hash=digest), sort_keys=True, separators=(",", ":"))
-        with open(self.audit_path, "a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        # 0600, like every other file in the state directory. A plain `open(..., "a")`
+        # creates the file 0644, so the audit log -- which records *who was denied
+        # access to which asset*, i.e. exactly the reconnaissance map an attacker
+        # wants -- was readable by every local user while the ciphertext beside it was
+        # not. `os.open` with an explicit mode is used because the `mode` argument to
+        # `open()` is masked by the umask only on creation; passing it explicitly
+        # documents the intent, and the chmod covers a file created by an older build.
+        fd = os.open(self.audit_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            with os.fdopen(fd, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            raise
+        try:
+            os.chmod(self.audit_path, 0o600)
+        except OSError:
+            pass
         state["audit_seq"] = seq
         state["audit_head"] = digest
         return digest

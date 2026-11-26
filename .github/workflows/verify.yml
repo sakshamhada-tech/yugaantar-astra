@@ -49,6 +49,8 @@ jobs:
         run: "python scripts/phase3_acceptance.py"
       - name: Phase 3 crash-recovery kills (real subprocesses, 5 fault points)
         run: "python -m pytest tests/test_phase3_recovery.py -q"
+      - name: Red team gate (23 attacks against the shipped adapter)
+        run: "python scripts/redteam.py"
       - name: Phase 5 messaging acceptance (goals 9-12, adversarial, real subprocesses)
         run: "python scripts/phase5_acceptance.py"
       - name: Phase 4 detection acceptance (goals 6-8, real subprocesses)

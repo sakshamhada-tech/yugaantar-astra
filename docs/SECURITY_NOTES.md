@@ -1199,3 +1199,128 @@ gate stops measuring anything.
    which the adapter keeps. Every other Phase 5 check drives a subprocess.
 5. **Still not run on macOS**, and no real network was used — the "nodes" are
    directories and processes on one machine.
+
+---
+
+# Phase 6 — red team: attacking our own adapter
+
+The instructor will attempt to break this system. This section is the record of doing
+it first. Every attack below was **run against the shipped adapter** (`redteam.py`,
+23 checks), and the three that succeeded are now fixed and pinned by tests.
+
+    python scripts/redteam.py      # 23/23 attacks held
+
+## P6-1. Findings, in order of severity
+
+### F1 (high): a damaged state file crashed the adapter instead of denying — FIXED
+
+**Attack.** Delete, empty, truncate, or write garbage into an asset envelope file, then
+read that asset.
+
+**Result before the fix.** `exit 1`, **empty stdout**, generic message on stderr. Four
+distinct corruptions, all identical.
+
+**Why it is high, not medium.** Not because data leaked — nothing did — but because the
+adapter contract is *one JSON object out, always*. A caller that assumes a reply (the
+judge's harness, a supervisor, a retry loop) fails differently and worse when it gets
+nothing. An attacker who can damage one file on disk turns every subsequent read into a
+protocol violation.
+
+**Root cause.** Two sibling exception hierarchies: `store.StoreError` and
+`keystore.KeyStoreError`. Neither subclasses the other. `_open_asset` calls
+`read_key_file`, which raises `KeyStoreError`; the callers catch `StoreError`. The
+exception escaped `team_app.dispatch` and reached `track4_service.py`, which correctly
+refuses to print details and so printed nothing.
+
+**Same bug, two more sites.** A corrupt `keyring.json` crashed `read` because
+`self.ring.load()` sat outside the `try` that guarded `by_version`. And a state
+directory replaced by a regular file crashed **every** KV operation, because
+`StateStore()` is constructed inside `dispatch` ahead of the `except StoreError` clause.
+
+**Fix.** `KeyStoreError` is imported and named at both boundaries (`store._decide`,
+`team_app.dispatch`), and the two specific calls are wrapped. A sweep of 12 disk
+corruptions × 12 operations = **144 combinations** now yields zero crashes.
+
+**Residual, stated:** the sweep covers the operations and corruptions in `redteam.py`,
+not all possible filesystem behaviour. A read-only filesystem, ENOSPC mid-write, or an
+`OSError` outside those paths is not exercised.
+
+### F2 (low–medium): the audit log was world-readable — FIXED
+
+**Attack.** No attack needed: `ls -l`. `audit.jsonl` was `0644` while every other file,
+including the ciphertext, was `0600`.
+
+**Why it matters.** The log records `{"actor": "ravi", "asset": "brief",
+"decision": "deny"}` — who was denied access to what. That is a reconnaissance map: it
+tells a local attacker which assets exist and which identity is worth stealing, while
+the ciphertext beside it stays sealed. The confidentiality of the envelope is defeated
+by the metadata around it.
+
+**Root cause.** `open(path, "a")` creates with `0644`; the truncate path used
+`write_bytes`, also `0644`. Nothing set a mode because nothing had ever audited modes.
+
+**Fix.** Both paths create with `os.open(..., 0o600)` and repair the mode afterwards, so
+a file left by an older build is corrected on first use. Asserted by
+`test_no_file_in_the_state_directory_is_readable_by_other_users`, which walks the whole
+state tree rather than naming a file — so a *new* file added later is covered
+automatically.
+
+## P6-2. Attacks that held
+
+| Area | Attack | Result |
+| --- | --- | --- |
+| Authorization | non-owner, unknown, empty, `None`, `True`, object, trailing space, Cyrillic look-alike, `__proto__`, `../state` | all deny; no body; no crash |
+| Authorization | reusing a `request_id` to rewrite a recorded decision | refused (`request_id_reused`), original event untouched |
+| Authorization | revoke, then read | denied immediately; a different owner unaffected |
+| Crypto | verify the `protected_read` proof independently with the KEM secret | HMAC(ss, challenge‖body) matches |
+| Crypto | replay a captured proof under a new challenge | proof differs; the binding is to the challenge |
+| Crypto | non-owner requests a ciphertext to attack offline | deny — no ciphertext is handed out |
+| Crypto | key material in responses, stderr, or at rest | not present in any of the three |
+| Integrity | ciphertext bit-flip; envelope swapped between assets | deny (AES-GCM tag; AAD recipient label) |
+| Resources | 1 MB in one field; 8 MB single-line log; 5000 valid events | 0.11–0.22 s against an 8 s budget |
+| Detection | 8 hostile field values | quarantined, counted, never echoed into the report |
+| Messaging | re-addressed fragment; replay; 8 malformed wire shapes; stolen ticket | refused, and a forgery does not poison the genuine message |
+
+## P6-3. The one attack that succeeds, stated plainly
+
+**Rewriting `state.json` grants access.** Change `owners.brief` from `maya` to `ravi`
+and `ravi` reads the asset. The asset envelope still cannot be *forged* — the AAD binds
+it to the recipient label and the GCM tag fails — but the policy that decides who may
+open it lives in the same directory as the keys that open it.
+
+This is not a bug to patch; it is the trust boundary, and it is the same boundary as in
+Phases 1–5: **whoever can write the state directory is the service.** Adding a MAC over
+`state.json` would move the problem, not solve it, because the verifying key would sit in
+the same directory — `redteam.py` reports this as a statement rather than a failure so
+there is no pretence that it was fixed.
+
+The honest mitigation is deployment, and it is written in the README: the state
+directory must be owned by the service user, mode `0700`, on a host the attacker does not
+already control. Under the organizer's sandbox the state directory is fresh per run, so
+the attack is not reachable in the graded scenario.
+
+## P6-4. Explicitly out of scope
+
+Stated so a reviewer is not left guessing, and so the limits are not mistaken for
+oversights:
+
+1. **Root, or code execution as the service user.** The trust boundary above.
+2. **A modified interpreter or injected package.** `pqcrypto` and `cryptography` are
+   pinned and imported as trusted; supply-chain integrity of the wheel is not verified
+   at runtime.
+3. **Sub-millisecond side channels across a process boundary.** Measured: a deny for an
+   existing asset is 1.2× a deny for an unknown one in-process, opposite in sign to the
+   usual timing-oracle direction, and ~75 ms of process startup dominates the actual
+   request. No claim is made that a co-located attacker could not do better.
+4. **Deeply nested JSON.** Depth >~1000 raises `RecursionError` inside
+   `track4_service.py`'s own `json.loads` — the organizer's harness, which is
+   byte-identical to the starter and must stay that way. Exit 1 with a generic message.
+   A legitimate request is depth 2; this needs a hostile caller sending a request it did
+   not expect to succeed at.
+5. **Message size is bounded by the wire format, not by policy.** `MAX_FRAGMENTS` is
+   65 535 because the index and total travel in 2-byte fields, so the largest
+   acceptable body is exactly 67 107 840 bytes (65 535 × 1024). One byte more is
+   refused. A 64 MiB body is therefore *accepted* by design: the sandbox prohibits DoS
+   against shared services, so the limit is the protocol's, and a lower cap would reject
+   a legitimate large message. Nothing here protects against a caller who decides to
+   send several such messages in parallel.

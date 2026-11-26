@@ -40,7 +40,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install --only-binary=:all: -r requirements.lock -r requirements-dev.lock
       - name: Test
-        run: "PYTHONPATH=src:. python -m pytest tests -q"
+        # print the failing test names as workflow annotations, because the raw job log
+        # is not always retrievable
+        run: |
+          set -o pipefail
+          PYTHONPATH=src:. python -m pytest tests -q --tb=short 2>&1 | tee /tmp/pytest.log
+      - name: Report failures as annotations
+        if: failure()
+        run: |
+          grep -E "^(FAILED|ERROR)" /tmp/pytest.log | head -40 | while IFS= read -r line; do
+            echo "::error title=pytest::${line:0:800}"
+          done
+          echo "--- last 60 lines of the run ---"
+          tail -60 /tmp/pytest.log | while IFS= read -r line; do
+            echo "::error title=tail::${line:0:800}"
+          done
       - name: Lost-device walkthrough (checks no plaintext at rest)
         run: "python scripts/demo_lost_device.py"
       - name: Phase 2 messaging acceptance (goals 9-12, real subprocesses)
@@ -49,6 +63,10 @@ jobs:
         run: "python scripts/phase3_acceptance.py"
       - name: Phase 3 crash-recovery kills (real subprocesses, 5 fault points)
         run: "python -m pytest tests/test_phase3_recovery.py -q"
+      - name: Red team gate (38 attacks against the shipped adapter)
+        run: "python scripts/redteam.py"
+      - name: Phase 6 acceptance (attack suite, fix proven by removing it, dashboard honesty)
+        run: "python scripts/phase6_acceptance.py"
       - name: Phase 5 messaging acceptance (goals 9-12, adversarial, real subprocesses)
         run: "python scripts/phase5_acceptance.py"
       - name: Phase 4 detection acceptance (goals 6-8, real subprocesses)
@@ -99,10 +117,16 @@ jobs:
           printf '%s' '{"op":"read","actor":"maya","asset":"brief","request_id":"r1"}' \
             | docker run --rm -i --read-only --tmpfs /tmp pqc-kv:phase1
       - name: Organizer validator against the image
+        # The validator writes __pycache__ next to the toolkit, so the toolkit mount
+        # cannot be read-only: that made `docker run` exit 125 before the validator
+        # ever started, which reads as a failing validator when it is a container
+        # error. The toolkit is a throwaway clone inside the workspace, so letting the
+        # container write to it costs nothing.
         run: |
           git clone --depth 1 https://github.com/ScalerOpenSourceLabs/Track-4-Toolkit.git toolkitchk
+          ls -l toolkitchk/validate.py
           docker run --rm \
-            -v "$PWD/toolkitchk:/toolkit:ro" \
+            -v "$PWD/toolkitchk:/toolkit" \
             -v "$PWD/track4_service.py:/toolkit/track4_service.py:ro" \
             -v "$PWD/team_app.py:/toolkit/team_app.py:ro" \
             -v "$PWD/src:/toolkit/src:ro" \

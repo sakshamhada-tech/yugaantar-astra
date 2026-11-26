@@ -304,6 +304,147 @@ Both are recorded because they were the kind that produce a false PASS:
   reported 17/17. It now requires the specific reason, and deleting the check drops it
   to 15/17. A gate that accepts any failure measures nothing.
 
+## 1f. Phase 6 — red team: we attacked our own adapter first
+
+The live security assessment attacks this system. Rather than wait for that, the
+attacks are written down and run as a gate:
+
+```sh
+python scripts/redteam.py           # 38/38 attacks held
+python scripts/phase6_acceptance.py # 12/12, incl. proving the fix by removing it
+```
+
+Every check is an attack that **succeeded against an earlier build** or is a standard
+attack on a system of this shape. Three succeeded and are now fixed:
+
+| # | Severity | Attack | Before | After |
+| --- | --- | --- | --- | --- |
+| F1 | **high** | delete / empty / truncate / corrupt an asset file, then read it | `exit 1`, **empty stdout** — a protocol violation, on four separate corruptions | `{"decision": "deny"}` |
+| F1b | high | corrupt `keyring.json`; replace the state directory with a file | crash on `read`; crash on **every** KV operation | refusal, opaque |
+| F2 | low–med | `ls -l` | `audit.jsonl` at **0644** while the ciphertext was 0600 — a recon map of who was denied what | every state file 0600, asserted by walking the tree |
+
+**F1's root cause is worth stating** because it is the kind of bug that reads as harmless
+and is not: the project has two sibling exception hierarchies, `StoreError` and
+`KeyStoreError`, and neither subclasses the other. Any path that reads key material can
+raise an exception the store's handlers do not catch, so the process exits 1 with nothing
+on stdout. Three separate sites did this.
+
+After the fix, a sweep of **12 disk corruptions × 12 operations = 144 combinations**
+produces zero crashes (`redteam.py` covers the same ground as a standing gate).
+
+### The one attack that still works, stated plainly
+
+**Rewriting `state.json` grants access.** Change `owners.brief` from `maya` to `ravi`
+and `ravi` reads the asset. The envelope still cannot be forged — the AAD binds it and
+the GCM tag fails — but *the policy that decides who may open it lives beside the keys
+that open it*. This is the trust boundary, the same one as in every earlier phase, and
+`redteam.py` prints it as a statement rather than a failure so there is no pretence it
+was fixed. Mitigation is deployment: state directory owned by the service user, `0700`,
+on a host the attacker does not already control. Under the organizer's sandbox the state
+directory is fresh per run.
+
+### What is explicitly out of scope
+
+Root or code execution as the service user · a modified interpreter or injected package ·
+sub-millisecond side channels across a process boundary (measured: a deny for an existing
+asset is 1.2× an unknown one *in-process*, and ~75 ms of process startup dominates the
+real request) · JSON nested past the interpreter's recursion limit, which the
+organizer's own `json.loads` refuses before our code runs · DoS by message volume, which
+the sandbox prohibits by policy and the wire format bounds at 67 107 840 bytes.
+
+### The second pass: attacking the classes the first pass missed
+
+The first 23 attacks went after authorization and the wire format. The second pass went
+after races, crashes, rollback, parser confusion and the log — and found one serious bug
+of our own.
+
+**A shortened log verified as intact.** `log_events_verify` returned `ok: true` after
+deleting the last record from `key-events.jsonl`, and `ok: true` after emptying the file
+completely. Deleting the newest record is exactly how an attacker removes the trace of the
+change they just made, and a hash chain cannot see it: truncation yields a *shorter valid
+chain*. The anchor now lives in `state.json`, stamped into the same atomic write as the
+event that produced it, and the report says whether an anchor was used
+(`anchor_checked`). Truncation now returns `head_mismatch`; a log with no anchor available
+says so rather than implying it is intact.
+
+The 799-test suite did not catch this, because every test asserted that *tampering* was
+caught and none asserted that *removal* was. So the new regression test is verified by
+un-fixing the code and requiring it to fail — and `phase6_acceptance.py` re-runs that
+check every time, so the test cannot quietly stop testing anything.
+
+| Second-pass attack | Result |
+| --- | --- |
+| 12 concurrent reads sharing one `request_id` | exactly 1 allow, 11 deny |
+| 12 readers racing a revocation | 0 allow, 12 deny |
+| 40 `SIGKILL`s mid-revoke | 0 unusable states, 0 leftover temp files |
+| duplicate JSON keys to escalate an actor | last key wins; the non-owner value is what is evaluated |
+| Cyrillic / ZWSP / fullwidth / BOM look-alike identities | all denied — compared as exact bytes, never normalised |
+| `NaN`, `Infinity`, typed `request_id` | refused without a crash |
+| symlink planted at a rotate target | rotate refused; nothing written outside the directory |
+| **truncate or empty the signed log** | **was `ok: true` → now `head_mismatch`** |
+| orphaned temp files after `SIGKILL` | were never reclaimed; now swept on the next lock |
+| reorder / edit / duplicate / forge a record | `chain_broken` |
+
+**Still undefeated, and stated as such: rollback of the state directory.** Restoring a
+snapshot taken before a revocation brings the revocation back off. No counter inside the
+directory can prevent this — the attacker is rewinding the directory itself — so it needs
+a TPM counter, a remote witness or an off-host ledger, none of which a single-container
+submission has. It costs **policy**, not **confidentiality**: the AEAD binds asset and
+owner identity, so an old directory cannot be replayed to read a body as someone else. An
+operator verifying the key-event log with an externally held anchor sees the rollback,
+because the restored log is shorter than the anchor says.
+
+Full detail is in `docs/SECURITY_NOTES.md` §P6-1…P6-8.
+
+## 1g. Seeing it work: `python scripts/dashboard.py`
+
+Every result in this repository is text in a terminal, which makes the system hard to see.
+One command serves a page that drives the **real adapter** — one process per request, the
+same way the judge drives it:
+
+```sh
+python scripts/dashboard.py --open    # http://127.0.0.1:8000
+```
+
+Six panels: access decisions (including a revocation taking effect on the next request),
+the ML-KEM protected read (ciphertext and HMAC proof, with the plaintext provably absent),
+end-to-end messaging (deliver, re-address to the wrong recipient, replay every fragment),
+detection over a sample log, signed-log verification in healthy and truncated states, and
+the 38-attack red-team gate.
+
+**No UI is required by the brief** — the submission is a two-page PDF plus a five-minute
+video, and no interface is scored. The dashboard exists because a reviewer who clicks a
+button and watches access flip to deny knows more than one who reads "revocation:
+verified". It is stdlib-only, read-only, loads nothing from the network, and runs against
+throwaway state directories under a temp path, so it cannot be why a demo fails in an
+offline container. `tests/test_dashboard.py` holds it to the adapter's answers so the page
+cannot drift into showing something the system would not actually do — that test caught a
+real drift while it was being written.
+
+## 1h. The submission documents
+
+The brief asks for **two** items: a two-page PDF and a five-minute video. Nothing else is
+assessed, and no repository document substitutes for either.
+
+The PDF is generated from `docs/BRIEF.md`, which follows the organiser's template — USP,
+architecture with a diagram, demo entry point and video link on page 1; assets, adversaries,
+trust boundaries, assumptions, defenses and exclusions on page 2.
+
+```sh
+pip install reportlab pypdf      # build-time only, not a runtime dependency
+python scripts/build_brief.py    # -> docs/yugaantar-astra-brief.pdf
+```
+
+The script **enforces** the two-page limit instead of trusting it: it fails if the output
+is any number of pages other than two, because a document that silently becomes three
+pages fails a stated requirement, and that should be loud at build time rather than
+discovered by a reviewer.
+
+Two placeholders still need filling before submission: the team member names, and the video
+URL. `docs/EVIDENCE.md` remains the optional per-goal evidence sheet — the template is
+explicit that it is **not** a third submission item, so it stays in the repository and is
+not attached.
+
 ## 2. Clean-machine setup (tested)
 
 Tested on Linux x86_64 with CPython 3.11 and 3.12; the judging runtime is

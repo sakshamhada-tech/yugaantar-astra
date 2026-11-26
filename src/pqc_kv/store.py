@@ -35,7 +35,8 @@ from .aead import NonceBudget
 from . import intent
 from .keyring import ACTIVE, KeyRing, KeyRingError
 from .keystore import (
-    KeyStore, b64d, b64e, ensure_private_dir, read_key_file, write_key_file,
+    KeyStore, KeyStoreError, b64d, b64e, ensure_private_dir, read_key_file,
+    write_key_file,
 )
 
 SCHEMA = 1
@@ -88,6 +89,36 @@ class StateStore:
         self._sealed_material_path = self.root / "synthetic-material.env"
 
     # ------------------------------------------------------------ locking/io
+    # Temp files left behind when a process is killed between `mkstemp` and `replace`.
+    # The `finally` in `_write_state` cannot run under SIGKILL, so leftovers are not a
+    # bug to be prevented -- they are a fact to be reclaimed.
+    ORPHAN_PREFIXES = (".state-", ".tmp-key-", ".tmp-")
+
+    def _sweep_orphans(self) -> int:
+        """Remove temp files orphaned by a previous crash. Caller must hold the lock.
+
+        Only safe while the lock is held: with the single-writer lock taken, any
+        matching file is stale by definition, because the live writer is us.
+        Leftovers are a small availability problem (a state directory that slowly
+        fills with junk) and a worse readability one -- an operator cannot tell a
+        crashed write from an attacked one.
+        """
+        removed = 0
+        try:
+            entries = list(self.root.iterdir())
+        except OSError:
+            return 0
+        for entry in entries:
+            if not entry.name.startswith(self.ORPHAN_PREFIXES):
+                continue
+            try:
+                if entry.is_file() or entry.is_symlink():
+                    entry.unlink()
+                    removed += 1
+            except OSError:
+                pass
+        return removed
+
     @contextmanager
     def _locked(self):
         """Single-writer lock so two concurrent requests cannot interleave state."""
@@ -95,6 +126,8 @@ class StateStore:
         try:
             os.chmod(self.lock_path, 0o600)
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            # After a crash this is the first moment it is provably safe to clear up.
+            self._sweep_orphans()
             yield
         finally:
             try:
@@ -179,7 +212,14 @@ class StateStore:
                     stale.unlink()
                 except OSError:
                     pass
-            self.audit_path.write_bytes(b"")
+            # Truncate without re-creating: `write_bytes` opens 0644, which is how the
+            # audit log kept its world-readable mode across every setup.
+            fd = os.open(self.audit_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.close(fd)
+            try:
+                os.chmod(self.audit_path, 0o600)
+            except OSError:
+                pass
             try:
                 self._sealed_material_path.unlink()
             except FileNotFoundError:
@@ -282,7 +322,15 @@ class StateStore:
         version = int(entry.get("key_version", 1))
         recipient = self.ring.kem_pair(version)
         signer = self.ring.dsa_pair(version)
-        record = read_key_file(self.assets_dir / entry["file"])
+        # `read_key_file` raises KeyStoreError, which is NOT a StoreError: the two
+        # are separate hierarchies. Without this wrapper a deleted, empty or
+        # truncated asset file escaped every handler in team_app and killed the
+        # process (exit 1, no JSON) instead of producing a deny. Found by deleting
+        # the file on disk and reading it back.
+        try:
+            record = read_key_file(self.assets_dir / entry["file"])
+        except KeyStoreError:
+            raise StoreError("stored envelope missing or unreadable") from None
         try:
             env = envelope.from_dict(json.loads(record["envelope"]))
         except (KeyError, TypeError, ValueError):
@@ -353,8 +401,11 @@ class StateStore:
         N before rotation happened. That is the only kind of request the cutoff can
         meaningfully affect, and it is the case tested end to end.
         """
-        ring = self.ring.load()
+        # `load()` itself raises KeyRingError on a corrupt ring, and it was called
+        # outside this try -- so a damaged keyring.json killed the process instead of
+        # refusing the request. Both calls belong inside the guard.
         try:
+            ring = self.ring.load()
             entry = self.ring.by_version(ring, version)
         except KeyRingError:
             return False
@@ -378,8 +429,10 @@ class StateStore:
             return "deny", "owner_required", None
         try:
             body = self._open_asset(asset, state["assets"][asset])
-        except StoreError:
+        except (StoreError, KeyStoreError):
             # Fail closed: a corrupt/tampered asset is a denial, never a fallback.
+            # KeyStoreError is listed explicitly because key-file reading lives in a
+            # different exception hierarchy and a missed wrapper must still deny.
             return "deny", "asset_integrity_failure", None
         return "allow", "owner_allowed", body
 
@@ -392,8 +445,12 @@ class StateStore:
                 state["disabled"].append(actor)
                 # Monotonic counter; the rollback check for backups compares it.
                 state["revocation_seq"] = int(state.get("revocation_seq", 0)) + 1
+                # The event is recorded BEFORE the state write, because recording it
+                # stamps `events_head`/`events_count` into `state` -- and this write is
+                # what persists that stamp. Recording afterwards leaves the anchor one
+                # event stale, which makes a genuine log fail verification.
+                self.record_event("revoke", actor if _safe_actor(actor) else "", state=state)
                 self._write_state(state)
-                self.record_event("revoke", actor if _safe_actor(actor) else "")
                 self._append_audit(state, {
                     "op": "revoke",
                     "actor": actor,
@@ -476,9 +533,12 @@ class StateStore:
             })
             intent.fault_point("after_commit")
             intent.clear(self.root)
-            # Goal 5: every rotation is a key event. Written after the commit so a
-            # crash cannot leave an event for a rotation that did not happen.
-            self.record_event("rotate", "", f"v{before}-to-v{new_entry.version}")
+            # Goal 5: every rotation is a key event. The commit marker above is what
+            # guarantees a crash cannot leave an event for a rotation that did not
+            # happen, so the event may be recorded and then persisted with the stamp
+            # it writes into `state`.
+            self.record_event("rotate", "", f"v{before}-to-v{new_entry.version}", state=state)
+            self._write_state(state)
         return {
             "active_version": new_entry.version,
             "retiring_version": old_entry.version,
@@ -612,8 +672,8 @@ class StateStore:
                 "decision": "restore", "rule": f"keys_v{int(state.get('active_version', 1))}",
                 "ts": _now(),
             })
+            self.record_event("restore", "", f"keys-{len(payload)}", state=state)
             self._write_state(state)
-            self.record_event("restore", "", f"keys-{len(payload)}")
         return {"restored": sorted(payload), "count": len(payload)}
 
     def recovery_pending(self) -> bool:
@@ -690,7 +750,8 @@ class StateStore:
                 "op": "recover", "to_version": entry.version, "resealed": completed,
             })
             intent.clear(self.root)
-            self.record_event("recover", "", f"to-v{entry.version}")
+            self.record_event("recover", "", f"to-v{entry.version}", state=state)
+            self._write_state(state)
         return {
             "recovered": True,
             "action": "completed",
@@ -870,10 +931,25 @@ class StateStore:
         record = dict(record, seq=seq, prev=prev)
         digest = _digest(json.dumps(record, sort_keys=True, separators=(",", ":")))
         line = json.dumps(dict(record, hash=digest), sort_keys=True, separators=(",", ":"))
-        with open(self.audit_path, "a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        # 0600, like every other file in the state directory. A plain `open(..., "a")`
+        # creates the file 0644, so the audit log -- which records *who was denied
+        # access to which asset*, i.e. exactly the reconnaissance map an attacker
+        # wants -- was readable by every local user while the ciphertext beside it was
+        # not. `os.open` with an explicit mode is used because the `mode` argument to
+        # `open()` is masked by the umask only on creation; passing it explicitly
+        # documents the intent, and the chmod covers a file created by an older build.
+        fd = os.open(self.audit_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            with os.fdopen(fd, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            raise
+        try:
+            os.chmod(self.audit_path, 0o600)
+        except OSError:
+            pass
         state["audit_seq"] = seq
         state["audit_head"] = digest
         return digest
@@ -892,22 +968,71 @@ class StateStore:
         pair = KeyStore(self.root / "log-identity").signing_keypair("eventlog")
         return logsign.EventLog(self.root / "key-events.jsonl", pair.secret_key, pair.public_key)
 
-    def record_event(self, action: str, actor: str = "", detail: str = "") -> dict:
-        """Append a signed key event. Refuses hostile identifiers outright."""
+    def record_event(self, action: str, actor: str = "", detail: str = "",
+                     state: dict | None = None) -> dict:
+        """Append a signed key event, and remember the resulting head.
+
+        The head is written into `state.json` after every append so that
+        `log_events_verify` can anchor against it without an operator having to
+        remember anything. This does **not** make truncation unforgeable -- an attacker
+        who can write the state directory can rewrite `events_head` too -- but it
+        separates two cases that used to look identical:
+
+        * an anchored head that still matches: the log is consistent *and* is the one
+          this state expects;
+        * an anchored head that does not: the log was replaced or truncated.
+
+        The unforgeable version needs an anchor outside the state directory, which is
+        what the operator's `expected_head` provides. Both are supported.
+        """
         from . import logsign
 
-        state = self._read_state()
-        detail = detail or f"v{int(state.get('active_version', 1))}"
+        # NOTE: do NOT rebind `state` here. It is the caller's dict, and shadowing it
+        # with a fresh read silently discarded every head stamp -- which is exactly
+        # what a first version of this function did.
+        current = state if state is not None else self._read_state()
+        detail = detail or f"v{int(current.get('active_version', 1))}"
         try:
-            return self._event_log().append(action=action, actor=actor, detail=detail)
+            record = self._event_log().append(action=action, actor=actor, detail=detail)
         except logsign.LogError:
             # Never write a record we could not validate; the caller decides what to
             # do. The audit log still has the raw attempt.
             raise StoreError("event rejected") from None
+        # Stamp the head into the caller's in-memory state rather than writing a
+        # second copy. Callers hold the lock and write `state` themselves after this
+        # returns, so a write here would be discarded -- and worse, would persist a
+        # state that later got overwritten. Passing `state` keeps the event and the
+        # head in one atomic update.
+        if state is not None:
+            try:
+                head, count = self._event_log().head()
+                state["events_head"] = head
+                state["events_count"] = count
+            except (StoreError, OSError):
+                # The event is already durably appended; failing to remember its head
+                # must not fail the operation that caused it.
+                pass
+        return record
+
+    def remember_events_head(self, state: dict) -> None:
+        """Stamp the current head into a state dict the caller is about to write."""
+        try:
+            head, count = self._event_log().head()
+        except Exception:
+            return
+        state["events_head"] = head
+        state["events_count"] = count
 
     def verify_events(self, expected_head: str | None = None) -> dict:
         """Full chain + signature walk, optionally against a remembered head."""
         return self._event_log().verify(expected_head=expected_head)
+
+    def remembered_events_head(self) -> str:
+        """The head recorded in state.json at the last event write, or ""."""
+        try:
+            return str(self._read_state().get("events_head") or "")
+        except StoreError:
+            return ""
 
     def events_head(self) -> dict:
         head, count = self._event_log().head()

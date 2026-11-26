@@ -1199,3 +1199,336 @@ gate stops measuring anything.
    which the adapter keeps. Every other Phase 5 check drives a subprocess.
 5. **Still not run on macOS**, and no real network was used — the "nodes" are
    directories and processes on one machine.
+
+---
+
+# Phase 6 — red team: attacking our own adapter
+
+The instructor will attempt to break this system. This section is the record of doing
+it first. Every attack below was **run against the shipped adapter** (`redteam.py`,
+23 checks), and the three that succeeded are now fixed and pinned by tests.
+
+    python scripts/redteam.py      # 38/38 attacks held
+
+## P6-1. Findings, in order of severity
+
+### F1 (high): a damaged state file crashed the adapter instead of denying — FIXED
+
+**Attack.** Delete, empty, truncate, or write garbage into an asset envelope file, then
+read that asset.
+
+**Result before the fix.** `exit 1`, **empty stdout**, generic message on stderr. Four
+distinct corruptions, all identical.
+
+**Why it is high, not medium.** Not because data leaked — nothing did — but because the
+adapter contract is *one JSON object out, always*. A caller that assumes a reply (the
+judge's harness, a supervisor, a retry loop) fails differently and worse when it gets
+nothing. An attacker who can damage one file on disk turns every subsequent read into a
+protocol violation.
+
+**Root cause.** Two sibling exception hierarchies: `store.StoreError` and
+`keystore.KeyStoreError`. Neither subclasses the other. `_open_asset` calls
+`read_key_file`, which raises `KeyStoreError`; the callers catch `StoreError`. The
+exception escaped `team_app.dispatch` and reached `track4_service.py`, which correctly
+refuses to print details and so printed nothing.
+
+**Same bug, two more sites.** A corrupt `keyring.json` crashed `read` because
+`self.ring.load()` sat outside the `try` that guarded `by_version`. And a state
+directory replaced by a regular file crashed **every** KV operation, because
+`StateStore()` is constructed inside `dispatch` ahead of the `except StoreError` clause.
+
+**Fix.** `KeyStoreError` is imported and named at both boundaries (`store._decide`,
+`team_app.dispatch`), and the two specific calls are wrapped. A sweep of 12 disk
+corruptions × 12 operations = **144 combinations** now yields zero crashes.
+
+**Residual, stated:** the sweep covers the operations and corruptions in `redteam.py`,
+not all possible filesystem behaviour. A read-only filesystem, ENOSPC mid-write, or an
+`OSError` outside those paths is not exercised.
+
+### F2 (low–medium): the audit log was world-readable — FIXED
+
+**Attack.** No attack needed: `ls -l`. `audit.jsonl` was `0644` while every other file,
+including the ciphertext, was `0600`.
+
+**Why it matters.** The log records `{"actor": "ravi", "asset": "brief",
+"decision": "deny"}` — who was denied access to what. That is a reconnaissance map: it
+tells a local attacker which assets exist and which identity is worth stealing, while
+the ciphertext beside it stays sealed. The confidentiality of the envelope is defeated
+by the metadata around it.
+
+**Root cause.** `open(path, "a")` creates with `0644`; the truncate path used
+`write_bytes`, also `0644`. Nothing set a mode because nothing had ever audited modes.
+
+**Fix.** Both paths create with `os.open(..., 0o600)` and repair the mode afterwards, so
+a file left by an older build is corrected on first use. Asserted by
+`test_no_file_in_the_state_directory_is_readable_by_other_users`, which walks the whole
+state tree rather than naming a file — so a *new* file added later is covered
+automatically.
+
+## P6-2. Attacks that held
+
+| Area | Attack | Result |
+| --- | --- | --- |
+| Authorization | non-owner, unknown, empty, `None`, `True`, object, trailing space, Cyrillic look-alike, `__proto__`, `../state` | all deny; no body; no crash |
+| Authorization | reusing a `request_id` to rewrite a recorded decision | refused (`request_id_reused`), original event untouched |
+| Authorization | revoke, then read | denied immediately; a different owner unaffected |
+| Crypto | verify the `protected_read` proof independently with the KEM secret | HMAC(ss, challenge‖body) matches |
+| Crypto | replay a captured proof under a new challenge | proof differs; the binding is to the challenge |
+| Crypto | non-owner requests a ciphertext to attack offline | deny — no ciphertext is handed out |
+| Crypto | key material in responses, stderr, or at rest | not present in any of the three |
+| Integrity | ciphertext bit-flip; envelope swapped between assets | deny (AES-GCM tag; AAD recipient label) |
+| Resources | 1 MB in one field; 8 MB single-line log; 5000 valid events | 0.11–0.22 s against an 8 s budget |
+| Detection | 8 hostile field values | quarantined, counted, never echoed into the report |
+| Messaging | re-addressed fragment; replay; 8 malformed wire shapes; stolen ticket | refused, and a forgery does not poison the genuine message |
+
+## P6-3. The one attack that succeeds, stated plainly
+
+**Rewriting `state.json` grants access.** Change `owners.brief` from `maya` to `ravi`
+and `ravi` reads the asset. The asset envelope still cannot be *forged* — the AAD binds
+it to the recipient label and the GCM tag fails — but the policy that decides who may
+open it lives in the same directory as the keys that open it.
+
+This is not a bug to patch; it is the trust boundary, and it is the same boundary as in
+Phases 1–5: **whoever can write the state directory is the service.** Adding a MAC over
+`state.json` would move the problem, not solve it, because the verifying key would sit in
+the same directory — `redteam.py` reports this as a statement rather than a failure so
+there is no pretence that it was fixed.
+
+The honest mitigation is deployment, and it is written in the README: the state
+directory must be owned by the service user, mode `0700`, on a host the attacker does not
+already control. Under the organizer's sandbox the state directory is fresh per run, so
+the attack is not reachable in the graded scenario.
+
+## P6-4. Explicitly out of scope
+
+Stated so a reviewer is not left guessing, and so the limits are not mistaken for
+oversights:
+
+1. **Root, or code execution as the service user.** The trust boundary above.
+2. **A modified interpreter or injected package.** `pqcrypto` and `cryptography` are
+   pinned and imported as trusted; supply-chain integrity of the wheel is not verified
+   at runtime.
+3. **Sub-millisecond side channels across a process boundary.** Measured: a deny for an
+   existing asset is 1.2× a deny for an unknown one in-process, opposite in sign to the
+   usual timing-oracle direction, and ~75 ms of process startup dominates the actual
+   request. No claim is made that a co-located attacker could not do better.
+4. **Deeply nested JSON.** Depth >~1000 raises `RecursionError` inside
+   `track4_service.py`'s own `json.loads` — the organizer's harness, which is
+   byte-identical to the starter and must stay that way. Exit 1 with a generic message.
+   A legitimate request is depth 2; this needs a hostile caller sending a request it did
+   not expect to succeed at.
+5. **Message size is bounded by the wire format, not by policy.** `MAX_FRAGMENTS` is
+   65 535 because the index and total travel in 2-byte fields, so the largest
+   acceptable body is exactly 67 107 840 bytes (65 535 × 1024). One byte more is
+   refused. A 64 MiB body is therefore *accepted* by design: the sandbox prohibits DoS
+   against shared services, so the limit is the protocol's, and a lower cap would reject
+   a legitimate large message. Nothing here protects against a caller who decides to
+   send several such messages in parallel.
+
+---
+
+# Phase 6, second pass — attacking the classes the first pass missed
+
+The first 23 attacks went after authorization and the wire format. That left whole
+classes untouched: what happens when two requests arrive at once, when the process is
+killed mid-write, when the attacker can restore yesterday's directory, when the parser
+disagrees with itself, and when the log is *shortened* rather than edited. Each of those
+was attacked directly. Fifteen checks were added to `scripts/redteam.py`, which now runs
+38 and exits non-zero if any of them stops holding.
+
+## P6-5. The finding that mattered: a shortened log verified as intact
+
+This is the most serious result of the second pass, and it was ours.
+
+`EventLog.verify(*, expected_head=None)` walks the hash chain from `GENESIS` and reports
+`ok` if the chain is internally consistent and the final head matches `expected_head` —
+**but only when the caller supplies one.** The adapter's `log_events_verify` supplied
+none. The consequence:
+
+| Action taken against `key-events.jsonl` | What the verifier said |
+| --- | --- |
+| delete the last record | `ok: true` |
+| delete every record | `ok: true` |
+| reorder / edit / duplicate / forge a record | `chain_broken` |
+
+Deleting the newest record is exactly what an attacker with write access does to remove
+the trace of the change they just made, and the verifier was happy with it. A hash chain
+alone cannot see this: truncation produces a *shorter valid chain*. Something outside the
+file has to remember how long the file should be.
+
+**Fix, in two parts, because either alone is insufficient.**
+
+1. `StateStore.record_event(..., state=...)` now stamps `events_head` and
+   `events_count` into the caller's state dictionary, so the anchor lands in the *same*
+   atomic write as the event that produced it. There is no window where the log has a
+   record the state file does not know about.
+2. `log_events_verify` falls back to `StateStore.remembered_events_head()` when the
+   caller passes no anchor, and reports `anchor_checked` so the caller can tell which
+   happened. When no anchor exists at all it says so in a `note` rather than implying the
+   log is intact.
+
+After the fix: truncation and emptying both return `ok: false, reason: "head_mismatch"`;
+an untouched log returns `ok: true, anchor_checked: true`; and removing the anchor from
+`state.json` makes the reply say `anchor_checked: false` instead of quietly passing.
+
+**This bug was invisible to the 799-test suite.** Every test asserted that tampering was
+caught; none asserted that *removal* was caught. The regression test —
+`tests/test_log_truncation.py` — was checked by reverting the fix and confirming three of
+its nine tests fail. A test that passes both with and without the fix proves nothing.
+
+**What this still cannot detect:** the anchor lives in `state.json`, in the same directory
+as the log. An attacker who rewrites the log *and* the anchor consistently produces
+something that verifies. Detecting that needs a copy of the head held outside the
+directory — a different host, a printed digest, an operator's notes. The adapter accepts
+an operator-supplied `expected_head` for exactly this, and that path is tested.
+
+## P6-6. The attack that still works: rollback of the state directory
+
+Stated plainly because it is the weakest remaining property.
+
+Restoring a snapshot of `$TRACK4_STATE_DIR/pqc-kv-state` taken *before* a revocation
+brings the revocation back off — the revoked identity reads the asset again. Restoring a
+snapshot taken before a rotation makes the retired key version active again. Both were
+demonstrated, and the red-team gate records the result rather than pretending otherwise.
+
+There is no monotonic counter held outside the directory, so no in-directory mechanism
+can defeat this. **The cause is that policy lives in the same trusted blob as the
+ciphertext, and whoever can write that blob can restore any earlier version of it.**
+Fixing it properly needs a store the attacker cannot rewind: a TPM monotonic counter, a
+remote witness, or a signed append-only ledger on another host. None exists in a
+single-container submission, and inventing one that lives in the same directory would be
+theatre.
+
+What *is* true, and matters: rollback changes **policy**, not **confidentiality**. The
+protected bodies are sealed with an AEAD whose associated data binds the asset id and the
+owner identity, so a body captured under one policy cannot be re-opened under another
+identity by replaying an old directory. And an operator who verifies the key-event log
+with an externally held anchor sees the rollback, because the restored log is shorter than
+the anchor says it should be — the same mechanism as P6-5.
+
+## P6-7. Attacks that held, second pass
+
+| Attack | Result |
+| --- | --- |
+| 12 concurrent reads sharing one `request_id` | exactly 1 allow, 11 deny — the lock makes check-and-consume atomic |
+| 12 readers racing a revocation | 0 allow, 12 deny — no reader observes pre-revoke state after the write lands |
+| 40 `SIGKILL`s at random points during a revoke | 0 unusable states, 0 leftover `.state-*` temp files; `mkstemp` → `fsync` → `replace` is doing its job |
+| duplicate JSON keys (`actor` twice) | last key wins, which is what `json` does; the non-owner value is the one evaluated, so duplication cannot escalate |
+| unicode look-alikes: Cyrillic `а`, ZWSP, fullwidth, BOM, trailing space, case change | all denied — identities are compared as exact bytes, never normalised |
+| type-juggled `request_id` (`1`, `true`, `null`, `1.5`, list, object), `NaN`, `Infinity` | refused without a crash |
+| symlink planted at a rotate target (`keys/*.key`, `keyring.json`) | rotate refused; the file outside the directory was untouched — no symlink write escape |
+| symlinked key file, symlinked lock file | denied |
+| symlinked `state.json` / asset file | honoured, and documented: a symlink inside the state directory is the same trust boundary, not a crossing of it |
+
+The grace window after rotation was also measured rather than assumed: an old key version
+is accepted for exactly **2** further reads, then denied permanently. The budget is a
+counter, not a wall clock, so it expires deterministically instead of depending on time.
+
+## P6-8. Why a dashboard exists, and what it is not
+
+Everything above is text in a terminal, which makes the system hard to see and easy to
+over-claim. `scripts/dashboard.py` serves one page that calls the **real adapter**, one
+process per request, exactly as the judge does — no mock, no second implementation that
+could drift. Six panels: access decisions, the ML-KEM protected read, end-to-end
+messaging (deliver / re-address / replay), detection over a sample log, signed-log
+verification with and without truncation, and the red-team gate itself.
+
+It is a **demonstration surface, not a judged component.** The brief's submission items
+are a two-page PDF and a five-minute video; no UI is required, and none is scored. It
+exists because a reviewer who can click a button and watch a revocation take effect knows
+more than one who reads "revocation: verified". It is read-only, stdlib-only, has no
+hosted assets, and runs against throwaway state directories under a temp path that are
+deleted on exit — so it cannot be the reason a demo fails in an offline container.
+
+## P6-9. Two defects in the *gates*, found only by running them on someone else's machine
+
+Both were mine, and both are the kind that make a green build meaningless.
+
+**The test that corrupted one file and asserted about another.** CI reported four
+failures in `test_a_damaged_asset_file_denies_instead_of_crashing`, with
+`{'decision': 'allow', 'body': 'MAYA-SECRET'}` where a deny was expected. The product was
+correct. The test did this:
+
+```python
+mutate(next(iter((internal / "assets").glob("*.env"))))   # whichever file comes first
+code, body, _ = call(state, op="read", actor="maya", asset="brief", ...)
+assert body == {"decision": "deny"}
+```
+
+`glob` returns directory iteration order, which is not asset order. The setup fixture
+creates `brief` (owned by maya) and `notes` (owned by ravi). On the CI runner the first
+entry was **`notes`**, so the test damaged ravi's file, then read maya's — which was
+intact, and correctly allowed. It passed locally for the accidental reason that this
+filesystem returned `brief` first.
+
+The fix computes the path instead of discovering it, because the name is a pure function
+of the asset id: `asset-<sha256(asset)[:16]>.env`. The test now names the file it means,
+asserts the mutation hit it, and additionally asserts the *neighbouring* asset is still
+readable — one corrupt envelope must not take the store down. Verified order-independent
+by re-running with `Path.glob` monkeypatched to reverse its output, and verified still
+non-vacuous by removing both layers of the F1 defence and watching all four cases fail.
+
+The same latent bug existed in `attack_disk` in `scripts/redteam.py`, where it was worse
+than a test defect: as an *attack*, corrupting a random asset meant the cross-asset
+independence property was never actually tested. It now corrupts each asset in turn
+(both directions) and asserts the neighbour still opens.
+
+**The security check that failed at random.** `atomicity/sigkill-leaves-usable-state`
+asserted `not leftovers` after 12 `SIGKILL`s. It went from HELD to BROKEN between runs
+because a kill landing between `mkstemp` and `replace` leaves a `.state-*` file, and the
+`finally` that would unlink it **cannot run under SIGKILL**. The assertion was not strict;
+it was false, and whether it passed depended on where the signal landed.
+
+Worse, it was hiding a real observation. Two separate properties were being tested as one:
+
+1. *The state is never unusable after a kill.* True, and now asserted alone.
+2. *Orphaned temp files do not accumulate.* This was never true, and nothing reclaimed
+   them. Left alone, a crash-looping service slowly fills its state directory with junk,
+   and an operator cannot distinguish a crashed write from an attacked one.
+
+So the product gained a fix and the check was split in three. `StateStore._sweep_orphans()`
+now runs as the first action inside the single-writer lock — the first moment it is
+provably safe, because the live writer is us — and removes files matching
+`.state-`, `.tmp-key-`, `.tmp-`. The reclamation check no longer waits for a signal to
+land in the right microsecond: it plants one orphan per prefix and requires the next
+request to clear them, and a separate check measures the orphan count *before* any
+following request, since taking the lock would otherwise zero it and prove nothing.
+
+Three consecutive runs: 38/38, stable. The honest summary of the original state is that
+the second pass had a false-confidence defect — it reported a passing check for an
+invariant that was false half the time.
+
+### P6-9b. The third defect: a fix applied to one call site out of four
+
+Fixing the truncation finding meant stamping the log anchor into `state.json`. That stamp
+is written by `record_event(..., state=state)`, which mutates the caller's state dict — so
+the caller must persist that dict **afterwards** for the stamp to exist at all.
+
+`revoke` recorded the event and then wrote the state. `rotate`, `recover` and `restore`
+wrote the state and then recorded the event. The stamp went into a dict that nobody
+persisted, so `state.json` kept the anchor from the *previous* event.
+
+The symptom is the opposite of the original bug, and arguably worse: a completely genuine
+log failed verification with `head_mismatch`, `actual_head` equal to a correct chain head,
+and `first_bad` past the end of the file. Phase 3's `goal5/signed-chain` caught it — a
+check that had been passing for weeks — because it verifies the chain *after* a rotate.
+The truncation tests did not, because their fixture only revokes.
+
+Detection that cries wolf is worse than detection that stays quiet: an operator who sees
+`head_mismatch` on an untouched log learns to ignore the one signal that catches
+truncation. So the anchor's freshness is now a tested property, not an implementation
+detail: `test_the_anchor_matches_after_every_mutating_operation` runs each of the four
+mutating operations (revoke, rotate, restore, recover) and requires the persisted anchor
+and count to match the log exactly, then requires `verify_events()` to agree. Because it
+is parametrised over the operations, an operation added later without persisting its stamp
+fails at the operation that forgot, not somewhere unrelated.
+
+Verified by re-breaking `rotate` on purpose and watching exactly that one case fail.
+
+**The lesson this whole episode teaches, and it is the same one three times over:** the
+first-pass work was checked by tests I chose, and I chose tests that confirmed what I
+believed. Every one of these three defects was found by a gate that already existed and
+that I had not thought to re-run — the CI suite on another machine, Phase 3's chain check,
+and my own red-team gate run twice in a row. The fix for that is not more tests; it is
+running the ones that exist, in an environment that is not the one you developed in, more
+than once.

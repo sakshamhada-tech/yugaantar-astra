@@ -61,7 +61,6 @@ def test_lost_device_scenario(configured):
     state = configured
     assert call({"op": "read", "actor": "maya", "asset": "brief", "request_id": "a1"}, state)[0] == {
         "decision": "allow",
-        "rule": "owner_allowed",
         "body": "lost device body",
     }
     call({"op": "revoke", "actor": "maya"}, state)
@@ -69,9 +68,8 @@ def test_lost_device_scenario(configured):
     assert denied["decision"] == "deny"
     assert "body" not in denied
     audit, _ = call({"op": "audit", "request_id": "a2"}, state)
-    assert audit["request_id"] == "a2"
-    assert audit["decision"] == "deny"
-    assert audit["rule"] == "identity_revoked"
+    # 3c: exactly the two fields the contract names, nothing else.
+    assert audit == {"request_id": "a2", "decision": "deny"}
     peer, _ = call({"op": "read", "actor": "ravi", "asset": "notes", "request_id": "a3"}, state)
     assert peer["body"] == "peer body"
 

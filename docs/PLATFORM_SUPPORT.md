@@ -3,6 +3,36 @@
 You develop on macOS/arm64; judging runs on Linux/amd64. Every runtime
 dependency must therefore install **without a compiler** on both, from a wheel.
 
+## Read-only-rootfs check: Linux-only, and honest about it
+
+`scripts/verify_container_contract.sh` bind-mounts the code directory read-only with
+`unshare -r -m`. **`unshare` is Linux-only.** On macOS the script now detects this and
+exits **77** with an explicit "NOT verified here" message, and
+`scripts/phase1_acceptance.py` maps 77 to **SKIP**, not FAIL.
+
+Why SKIP rather than FAIL: a missing capability is not a security finding. Reporting it
+as FAIL trains the reader to ignore failures, which is how a real one gets missed.
+Equally, it is never reported as PASS — the skip list prints it every run with the
+reason, so it cannot be mistaken for green.
+
+Verified in this repo both ways:
+
+| Host | `unshare` present | Result |
+| --- | --- | --- |
+| Linux (this sandbox) | yes | full check runs, `all container-contract checks passed`, exit 0 |
+| macOS | no | `== SKIPPED: read-only rootfs + temp-only state ==`, exit 77, gate records SKIP |
+| Either, real breakage | — | gate still records **FAIL** (asserted with a simulated exit 1) |
+
+To actually verify the container contract on a Mac, use Docker:
+
+```sh
+docker build -t pqc-kv:phase3 .
+docker run --rm --read-only --tmpfs /tmp pqc-kv:phase3
+```
+
+`docker build` itself has never been executed in this environment (no daemon), which is
+stated in `docs/EVIDENCE.md` rather than glossed over.
+
 ## Stated OS requirement in the adapter contract
 
 `docs/adapter-v1.md` has exactly one OS-level statement, in "Process and state":

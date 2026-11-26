@@ -101,10 +101,81 @@ The headline numbers behind those claims:
 * one signature per message, not per fragment — measured at **5.96x wire size and
   ~17x CPU** for the per-fragment alternative (`docs/SECURITY_NOTES.md` section 6).
 
+## 1c. Phase 3 — key lifecycle and log integrity
+
+Goals 1–5: rotation, revocation across nodes, crash recovery, backup integrity, log
+integrity. Five new modules, none of which rewrite an earlier phase.
+
+| Goal | Module | What it does | Evidence |
+| --- | --- | --- | --- |
+| 1. Key rotation | `keyring.py` + `store.rotate()` | Versioned ring (active/retiring/retired/revoked). Rotation re-wraps every asset then retires the old version. The cutoff is a **count of accepted requests**, not wall time | `tests/test_phase3_rotation.py` (28) |
+| 2. Revocation across nodes | `cluster.py` | ML-DSA-signed, sequence-numbered notices. Signature checked before the payload is parsed. Idempotent, order-independent apply | `tests/test_phase3_cluster.py` (19) |
+| 3. Crash recovery | `intent.py` | `intent → re-wrap → commit → clear`; recovery lands on exactly one version. Fault hook kills real subprocesses at 5 named points | `tests/test_phase3_recovery.py` (21) |
+| 4. Backup integrity | `backup.py` | GCM + ML-DSA over manifest *and* ciphertext; operator-supplied key; rollback refused via monotone high-water marks | `tests/test_phase3_backup.py` (32) |
+| 5. Log integrity | `logsign.py` | Signed, hash-chained key-event log with strict identifier validation; head exportable for external anchoring | `tests/test_phase3_log.py` (28) |
+
+New adapter ops (all additive; `track4_service.py` is untouched): `rotate`,
+`key_status`, `recover`, `cluster_publish`, `cluster_sync`, `cluster_status`,
+`backup_create`, `backup_restore`, `log_head`, `log_events_head`, `log_events_verify`.
+
+### Run the Phase 3 demo and gate
+
+```sh
+python scripts/phase3_acceptance.py
+```
+
+Drives **real subprocesses** through `track4_service.py` and prints PASS/FAIL per goal.
+Last full run: **26 passed, 0 failed.**
+
+Numbers it prints, all measured (`perf_counter_ns`, not estimated):
+
+```sh
+python -m pytest tests/test_phase3_rotation.py -q -s | grep "rotation of"
+python -m pytest tests/test_phase3_cluster.py  -q -s | grep "propagation"
+```
+
+* rotation re-wrapping 20 assets: **67–97 ms** across six runs (~3.4–4.8 ms/asset)
+* revoke → **last** node of 3 enforcing: **median 324–360 ms**, worst 363 ms across
+  runs. Lower bound: every "node" is a local directory and a subprocess, with no
+  network delay, so most of this is process startup.
+* crash recovery after a real `os._exit(97)`: **92.9 ms** worst case
+* backup: 8/8 single-bit mutations refused; stale replay refused
+* log: 406 hostile strings fuzzed, **0** forged events
+
+### Try the attacks yourself
+
+```sh
+# what a revoked actor sees on each node, before and after syncing
+python -m pytest tests/test_phase3_cluster.py::test_a_node_that_was_offline_catches_up_then_rejects -q -s
+
+# kill the process mid-rotation at every named point, then recover
+python -m pytest tests/test_phase3_recovery.py -q
+
+# flip one bit in each backup region and watch all of them get refused
+python -m pytest tests/test_phase3_backup.py -q
+```
+
+### What Phase 3 does not fix
+
+Keys still sit beside the data — there is no KMS, no HSM, and no at-rest wrapping, so
+the state directory remains the trust boundary. The log's signing key lives in that
+same directory, so someone who can rewrite the log *and* read the key is undetectable;
+without an external anchor, truncation is invisible. The high-water marks that stop
+backup rollback are in the directory the backup protects. All simulated nodes share one
+machine, so no real network partition was tested. Full list in
+`docs/SECURITY_NOTES.md` §P3-7. The mutation log is `docs/BREAK_IT.md`.
+
 ## 2. Clean-machine setup (tested)
 
 Tested on Linux x86_64 with CPython 3.11 and 3.12; the judging runtime is
 Python 3.12. Nothing below needs network access at run time, only at install time.
+
+**On macOS:** one check in `scripts/phase1_acceptance.py` needs `unshare`, which is
+Linux-only. On a Mac it reports **SKIP** with the reason, not FAIL and not PASS — a
+missing capability is not a security finding, and calling it a failure would teach you
+to ignore failures. Everything else runs normally. To verify the container contract on
+a Mac, use `docker run --rm --read-only --tmpfs /tmp <image>`; see
+`docs/PLATFORM_SUPPORT.md`.
 
 ```sh
 git clone <this repo> && cd yugaantar-astra

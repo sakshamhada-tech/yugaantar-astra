@@ -4,8 +4,15 @@ Post-quantum, zero-trust access control for protected files. One owner reads a
 protected synthetic file; after revocation the same owner is denied, a second
 owner still reads their own file, and an audit record explains the denial.
 
-**Status: Phase 1 only.** Crypto foundation + adapter wiring + tests. Later phases
-(rotation, multi-node revocation, messaging, detection, backup) are **not** built.
+**Status: Phases 1 and 2.** Phase 1 is the crypto foundation plus adapter wiring;
+Phase 2 adds a secure messaging layer (goals 9–12: replay and recipient binding,
+forward secrecy, delivery under loss/reordering, resumption). Later phases
+(rotation interface, multi-node revocation, detection, backup) are **not** built.
+
+Everything below that says "Phase 1" is still accurate for Phase 1. Phase 2 has its
+own evidence table in section 1b and its own claims in `docs/SECURITY_NOTES.md`
+(sections 1–13 of the Phase 2 part), including a list of what it deliberately does
+*not* do.
 
 ---
 
@@ -274,11 +281,16 @@ len(mlkem_ss) || mlkem_ss`. Removing either component changes the key.
    chain is not detected. Goal 5 (log integrity) is therefore **partial**.
 4. **Single node, single writer.** A `flock` serialises writers, so no torn state,
    but there is no multi-node revocation (goal 2 is untested), no replication.
-5. **No forward secrecy claimed.** Each asset envelope uses a static recipient key,
-   so compromising that key after the fact can decrypt stored assets. Session-level
-   forward secrecy is goal 10 and is **not** addressed in Phase 1.
+5. **No forward secrecy for *stored* assets.** Each asset envelope uses a static
+   recipient key, so compromising that key after the fact can decrypt stored assets.
+   That is unchanged in Phase 2. Messaging sessions **are** forward secret (goal 10)
+   because they derive keys from fresh X25519 + ML-KEM secrets that are then erased —
+   but a stored file has no "after the fact" to protect, so the envelope stays static.
 6. **No replay protection on `protected_read`.** The challenge is echoed into the
-   HMAC but nothing tracks seen challenges (goal 9, not tested).
+   HMAC but nothing tracks seen challenges. Messaging **does** track them (goal 9):
+   replay is bounded by a persisted 4096-entry set and state is written before
+   plaintext is returned. The two paths are separate and the weaker one is the
+   adapter's own op.
 7. **Nonce budget accounting resets every process.** Bounded by rotating keys on
    each setup, so a key never seals more than one setup's assets (far below the
    2^20 in-process limit). A long-running deployment needs a persisted counter.
@@ -286,9 +298,11 @@ len(mlkem_ss) || mlkem_ss`. Removing either component changes the key.
    for comparisons and library primitives for crypto, but Python cannot promise
    constant time overall.
 9. **Not built on purpose in Phase 1:** key rotation interface (goal 1),
-   multi-node revocation (2), backup/restore (4), detection (6, 7, 8),
-   messaging replay/recipient binding UI (9), forward secrecy (10), delivery
-   under loss/reordering (11), session resumption (12).
+   multi-node revocation (2), backup/restore (4), detection (6, 7, 8).
+   **Built in Phase 2:** messaging replay and recipient binding (9), forward secrecy
+   for sessions (10), delivery under loss/reordering (11), resumption (12) — all with
+   the caveats in section 1b and `docs/SECURITY_NOTES.md` section 13. Resumption's
+   expiry is a redemption budget, not a clock, because no clock here can be trusted.
 
 ---
 

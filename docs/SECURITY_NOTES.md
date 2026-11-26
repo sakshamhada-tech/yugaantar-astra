@@ -655,3 +655,38 @@ ephemeral file being gone after establishment, a third party refusing a hello
 addressed elsewhere, opaque failures for malformed input, and the secret sweep. It
 is the load-bearing evidence that the on-disk state design works under the
 contract's one-process-per-request constraint, as opposed to only in-process tests.
+
+## 13. Known limits of Phase 2 (stated, not hidden)
+
+Everything below is a real limitation of what is implemented. None of it is
+"mitigated by design" hand-waving; each is a deliberate trade with a reason.
+
+1. **No DH ratchet.** The chain keys advance per message (`kdf.py`), but there is no
+   Diffie-Hellman ratchet between messages. Compromise of a session's root state
+   therefore opens the rest of that session, though not past sessions and not the
+   long-term key. A full Signal-style ratchet would need a fresh key exchange per
+   turn, which the one-process-per-request model makes expensive.
+2. **Resumption expiry is a budget, not a clock.** Section 11 above. An unused ticket
+   does not age out.
+3. **Tickets live in the same directory as session state**, so a ticket adds nothing
+   against an attacker who can already read that directory. It only ensures the
+   ticket *file* alone is useless.
+4. **Ephemeral erasure is best-effort.** Option B erases the initiator's pending
+   ephemerals by overwrite → unlink → directory fsync. On a journaling filesystem or
+   an SSD with wear levelling, the old blocks may persist. Section 5 states this;
+   repeating it here because it is the strongest physical limit of the design.
+5. **Revocation is not retroactive and not queued.** A revoked actor's already-derived
+   session keys are not zeroised, and messages sent while an actor is revoked fail
+   later rather than being delivered. Documented in section 8.
+6. **Reassembly is bounded.** 64 partial messages per session, 4096 tracked message
+   ids. Overflow evicts the oldest, which means a *very* old message id can be
+   replayed after eviction — the test suite exercises exactly that path and the answer
+   is "accepted as new". Bounded memory was the chosen trade.
+7. **Signing is per message, not per fragment.** Measured in section 6: per-fragment
+   costs 5.96x wire size and ~17x CPU. The consequence is that a single fragment
+   arriving alone is AEAD-authenticated but not *attributable* until fragment 0
+   arrives with the manifest signature.
+8. **No group messaging.** Two-party sessions only. No sender keys, no fan-out.
+9. **Untested on macOS/Apple Silicon** and `docker build` was never executed in this
+   environment (no daemon, no egress). Wheels were downloaded and checked for both
+   platforms/architectures, but "it builds there" is not a measurement I made.

@@ -43,6 +43,8 @@ jobs:
         run: "PYTHONPATH=src:. python -m pytest tests -q"
       - name: Lost-device walkthrough (checks no plaintext at rest)
         run: "python scripts/demo_lost_device.py"
+      - name: Phase 2 messaging acceptance (goals 9-12, real subprocesses)
+        run: "python scripts/phase2_acceptance.py"
 
   validator:
     name: organizer validator (ubuntu)

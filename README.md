@@ -60,6 +60,47 @@ Dockerfile               Python 3.12 / linux-amd64 image, offline-capable
 
 ---
 
+## 1b. Phase 2 — secure messaging
+
+Two identities, each with a long-term ML-DSA-65 signing key and an ML-KEM-768 key
+(fingerprint = SHA-256 over both public keys), run a **three-message signed
+handshake** in which both sides sign the same transcript hash. Session keys come from
+HKDF over that transcript plus a fresh X25519 secret and a fresh ML-KEM secret, so a
+session stays secret even if the long-term keys leak later.
+
+| Goal | What was built | Where | Evidence |
+| --- | --- | --- | --- |
+| 9. Replay + recipient binding | Header and AAD carry recipient user id *and* fingerprint, sender fingerprint, session id, message id, sequence, fragment index/total, protocol version. Bounded replay set, persisted before plaintext is returned | `messaging/wire.py`, `session.py`, `driver.py` | `test_messaging_wire.py` (41 tests), `test_messaging_driver.py` (30) |
+| 10. Forward secrecy | Fresh X25519 + fresh ML-KEM per session, hybrid; both sides sign the full transcript; 3 messages give mutual key confirmation | `messaging/handshake.py`, `hybrid.py` | `test_messaging_handshake.py` (22) |
+| 11. Loss / reordering | Each fragment independently authenticated with index+total in AAD; bounded skipped-key cache tolerates out-of-order delivery; incomplete messages are discarded with a reason code and message id, never partial plaintext | `messaging/wire.py`, `kdf.py`, `session.py`, `simnet.py` | `test_messaging_wire.py`, `test_messaging_kdf.py` (15), seeded `simnet` scenarios |
+| 12. Session resumption | Ticket bound to the peer fingerprint, ML-DSA proof of possession, fresh root per redemption, single use, budget-based expiry (no trusted clock) | `messaging/resumption.py` | `test_messaging_resumption.py` (14) |
+
+Both layers sit behind the unchanged `track4_service.py`; Phase 2 is exposed as 13
+additional `msg_*` operations through the same JSON shim (see `docs/SECURITY_NOTES.md`
+section 12 for why additions are allowed and why every failure is one opaque error).
+
+Run the Phase 2 gate:
+
+```sh
+python scripts/phase2_acceptance.py
+```
+
+It drives **real subprocesses** through `track4_service.py` — one process per request,
+exactly as the contract requires — and prints PASS/FAIL per check. Last full run:
+**16 passed, 0 failed.**
+
+The headline numbers behind those claims:
+
+* an 11 200-byte body becomes **11 authenticated fragments**; delivering 5 of them
+  yields nothing, with `incomplete` and the message id recorded; the rest arriving in
+  reverse still reassembles the exact body;
+* replaying all 11 fragments yields **0 delivered** and 11 duplicates;
+* re-addressing one fragment to another user fails the whole message as
+  `wrong_recipient`;
+* a Phase 1 `revoke` immediately stops Phase 2 delivery;
+* one signature per message, not per fragment — measured at **5.96x wire size and
+  ~17x CPU** for the per-fragment alternative (`docs/SECURITY_NOTES.md` section 6).
+
 ## 2. Clean-machine setup (tested)
 
 Tested on Linux x86_64 with CPython 3.11 and 3.12; the judging runtime is

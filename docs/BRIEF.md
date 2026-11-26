@@ -14,7 +14,7 @@ be answerable independently of the device asking — and still answerable once q
 computers break today's primitives. This project seals every protected body under
 ML-KEM-768, AES-256-GCM and ML-DSA-65, hash-chains every decision into an audit log, and
 applies a revocation on the **next** request rather than the next day. What distinguishes it
-is the proof rather than the feature list: 38 attacks against our own shipped adapter, 823
+is the proof rather than the feature list: 38 attacks against our own shipped adapter, 827
 tests, and a demonstration that shows failures being refused instead of described as
 refused.
 

@@ -696,3 +696,254 @@ Everything below is a real limitation of what is implemented. None of it is
 9. **Untested on macOS/Apple Silicon** and `docker build` was never executed in this
    environment (no daemon, no egress). Wheels were downloaded and checked for both
    platforms/architectures, but "it builds there" is not a measurement I made.
+
+---
+
+# Phase 3 — key lifecycle and log integrity (goals 1–5)
+
+Written as: what the component is, **what attack it stops**, and **its limits**. The
+limits are the point. Where a number is quoted a script measured it; where nothing
+measured it, the text says "not measured".
+
+New modules: `keyring.py` (goal 1), `cluster.py` (goal 2), `intent.py` (goal 3),
+`backup.py` (goal 4), `logsign.py` (goal 5). New ops: `rotate`, `key_status`,
+`recover`, `cluster_publish`, `cluster_sync`, `cluster_status`, `backup_create`,
+`backup_restore`, `log_head`, `log_events_head`, `log_events_verify`.
+
+## P3-1. `keyring.py` — versioned keys, and a cutoff that cannot be waited out
+
+**What it is.** A numbered ring of service keypairs. Each entry has an integer
+`version`, a `state`, and an integer grace budget. `active` seals new writes;
+`retiring` still serves reads; `retired` and `revoked` are refused.
+
+**What attacks it stops**
+
+* *Never rotating.* Before Phase 3 keys were created once and lived forever, so one
+  leak was permanent. Rotation now produces a new version and re-wraps all data.
+* *Rotating by demolition.* Phase 1's `setup()` deleted and re-created keys, which
+  would orphan every sealed asset. `rotate()` re-wraps first and never calls the wipe
+  path — a monkeypatch test asserts `setup` and `_rotate_keys` are never entered.
+* *Waiting out the cutoff.* A wall-clock grace period can be extended by anyone who
+  can move the system clock. The grace here is **a count of accepted requests**
+  (`epoch < grace` accepts; `epoch >= grace` rejects and flips the version to retired).
+  Integers in our own state cannot be forged by skewing a clock.
+* *Budget theft.* The budget is charged only when a request is **accepted**, so a
+  stream of denied requests cannot exhaust another client's grace.
+
+**"A request using the old key", defined precisely.** It is a `read` whose
+`key_version` field names a ring version that is not active. An ordinary read does not
+name one and therefore always uses the active version — which is what a normal client
+means. The cutoff can only ever affect a client that loaded data under version N and
+kept using it after rotation, which is exactly the in-flight case the grace budget is
+for. Exercised end to end through the adapter: `allow`, `allow`, then `deny` at the
+boundary with a grace of 2.
+
+**Measured.** Re-wrapping 20 assets takes **67–97 ms** across six runs
+(~3.4–4.8 ms/asset), printed by `test_rotation_cost_is_measured`. Reported as a range
+because the single first reading (67.2 ms) was a fast outlier; the later samples
+clustered at 87–97 ms. Timing on this sandbox is noisy, so no tighter claim is honest.
+
+**Limits**
+
+* Rotation is O(assets): it re-encrypts everything. Fine for this workload, a real
+  window for a large store. Not measured beyond 20 assets.
+* The grace budget is **per node** and lives in the state directory. Someone who can
+  write that directory can reset it. Same trust boundary as everything else here.
+* `retired` is a label, not a shred. The old key files are not zeroised, so a
+  filesystem-level attacker may still recover them. Erasing is best-effort, as with
+  the Phase 2 ephemerals.
+* No overlap window for *writers*: the moment a version retires, new writes must use
+  the new one. Two nodes rotating concurrently are not coordinated — see P3-2.
+
+## P3-2. `cluster.py` — signed, sequence-numbered notices
+
+**What it is.** A node publishes a notice `{kind, seq, payload, signer_fp, signature}`
+into a shared outbox directory; siblings pull with `cluster_sync` and apply.
+
+**What attacks it stops**
+
+* *Anyone can revoke anyone.* The signature is verified **before the payload is
+  parsed**, so a forged body never reaches a parsing path. A notice from a key the
+  node has not pinned is worthless.
+* *Replay an old notice.* A node keeps a per-`(kind, publisher)` high-water mark and
+  refuses anything that does not strictly advance it. Replaying last week's "rotation
+  to v2" after "rotation to v3" does nothing.
+* *Reorder to win.* Same mechanism: a lower sequence is refused, so the winner is the
+  highest sequence, not the last arrival.
+* *Text smuggling.* The signed encoding is length-prefixed, not plain JSON, so no
+  field value can shift a boundary. A payload containing `","kind":"revoke","seq":999`
+  stays a value (tested).
+* *Partial application.* Marks are fsynced before the caller is told anything was
+  applied, so an acknowledged revocation survives a crash.
+
+**Measured.** Revoke issued → **last** of 3 nodes enforcing it: **median 324–360 ms**
+across four independent runs, worst single sample 390 ms
+(`test_propagation_time_is_measured` reports 5 runs per invocation; the acceptance
+script reports 3). Method: publish on node 0, then loop `cluster_sync` + a real adapter
+`read` on each remaining node until it denies, timed with `perf_counter_ns`.
+**This is a lower bound for local processes with no network delay** — every node is a
+directory on one machine driven by a subprocess, mostly measuring process startup.
+
+**Limits**
+
+* **All nodes share one machine and one filesystem.** There is no network, so no real
+  partition, no message loss, no transport reordering, and no clock skew. The tests
+  simulate *absence of sync*, not a broken link.
+* **One publisher key is the whole authority.** Any node holding it can issue
+  anything; there is no quorum, no transparency log, no byzantine tolerance.
+* **Pull, not push.** Nothing propagates until someone calls `cluster_sync`. There is
+  no background daemon and no push notification.
+* The outbox is a plain directory: it is a channel, not a safe place. Trust comes from
+  the signature, never from the location.
+* Concurrent rotations on two nodes produce two notices with different targets; the
+  highest version wins. That is deterministic but not a consensus protocol.
+
+## P3-3. `intent.py` — write-ahead intent and crash recovery
+
+**What it is.** `intent → re-wrap → commit → clear`. Recovery reads the record and
+lands on exactly one version.
+
+**What attacks it stops**
+
+* *Half-migrated state.* A crash mid-rotation would otherwise leave some assets under
+  v1 and some under v2 with no record of the intent. Each asset carries the version
+  that sealed it, and the intent names the target, so recovery can finish the job.
+* *Losing a revocation.* Revocations live in `state["disabled"]`, which the intent
+  record never includes, so recovery cannot un-revoke anyone.
+* *A quiet lie about completion.* A rotation that never committed is not reported as
+  complete; the audit log gets a `recover` record saying what happened.
+
+**Recovery rule, and why "finish forward".** Re-sealing is idempotent and v(N+1) already
+exists, so finishing is one code path. Rolling back would have to un-create a version
+and re-seal backwards, doubling the failure surface to reach the same place. The
+requirement is *one consistent authorized version*, and both directions give that.
+
+**Measured.** 5 named fault points × a real `os._exit(97)` in a child process; **5/5**
+recover to exactly one active version with all assets readable and revocations intact
+(`test_recovery_lands_on_one_consistent_version`, parametrised). Worst recovery time
+**92.9 ms** in the acceptance script (single process, local disk).
+
+**The fault hook.** `TRACK4_FAULT_AT` is read from the environment once at import and
+then deleted from `os.environ`. It is not reachable from adapter input — a test sends
+`fault_at` and `TRACK4_FAULT_AT` as *request fields* and asserts exit 0. Only five
+known point names arm it; anything else is inert.
+
+**Limits**
+
+* "Finish forward" assumes the new version's keys exist, which they do because the
+  ring entry is written before any asset is re-sealed. A crash *between* creating the
+  ring entry and writing the intent is not simulated.
+* Recovery runs at the start of `rotate` and on the explicit `recover` op. A node that
+  is only ever read will not notice a stranded intent until something else runs.
+* The intent file is not replicated, so a node whose disk is lost loses its intent —
+  backup/restore (P3-4) is the recovery path for that, not the intent log.
+* `os._exit(97)` skips all interpreter cleanup, which is the point, but it also means
+  a torn write is possible in the filesystem. Atomic `os.replace` makes the *target*
+  file always either old or new; a partially-written temp file is abandoned.
+
+## P3-4. `backup.py` — authenticated backup, and rollback detection
+
+**What it is.** `manifest ‖ GCM ciphertext ‖ tag ‖ ML-DSA signature`. The backup key
+is supplied by the operator on every call and never stored.
+
+**What attacks it stops**
+
+* *Damage and tampering.* A bit flip in any region fails the GCM tag or the signature.
+  All 10 regions are tested, at three offsets each.
+* *Body swap under a valid manifest.* The signature covers the ciphertext as well as
+  the manifest, so keeping a signature and substituting a body fails.
+* *Wrong installation.* A backup signed by another key is refused; so is one encrypted
+  under the wrong operator key.
+* *Rollback to resurrect a revoked key.* The manifest carries `key_version` and
+  `revocation_seq`; a backup below this node's high-water marks is refused as stale.
+  This is the attack that matters: the replay is a *genuine, correctly signed* backup.
+* *Partial use.* `open_backup` either returns a fully verified payload or raises. There
+  is no partially-verified return value, so no caller can use unverified key material.
+
+**A design flaw found while testing.** The first version compared `log_head` for
+equality as well. That rejected a legitimate re-restore of the *current* backup,
+because the audit head advances on every write — so the check was simultaneously
+useless and harmful. Only the monotone counters are enforced now; `log_head` stays in
+the manifest for external anchoring, which is the only place a hash can be compared
+meaningfully.
+
+**Limits**
+
+* **The high-water marks live in the state directory the backup protects.** Someone who
+  can write that directory can lower them and then a replay looks legitimate. No code
+  can fix this: the file recording the answer is in the attacker's write scope.
+* **Restore into a fresh directory has no marks at all.** Without a value the operator
+  remembers (or a CI secret, or an append-only sink), a fresh restore cannot tell the
+  newest backup from an old one.
+* The backup key is the operator's problem: lose it and the backup is unrecoverable;
+  leak it and confidentiality is gone. There is no key escrow and no rotation of the
+  backup key itself.
+* Backups are not tested against a huge store; only the key files are backed up, not
+  the audit log or the intent record.
+* Not measured: backup size or time for a realistic key set.
+
+## P3-5. `logsign.py` — signed, strictly-encoded key-event log
+
+**What it is.** An append-only log where each record is hash-chained to its predecessor
+**and** individually signed with ML-DSA-65. Separate from `audit.jsonl`: that answers
+"what did this caller get and why", this answers "what happened to the keys".
+
+**What attacks it stops**
+
+* *Log injection / forging an event.* Identifiers are **validated, not sanitised** —
+  refused rather than rewritten, because a rewrite silently changes who a record is
+  about. The charset rules out newlines, quotes, control characters and all non-ASCII
+  scripts, including Cyrillic look-alikes. Records are hashed over a length-prefixed
+  encoding, so unambiguity comes from the encoding rather than from trusting an
+  escaper. Fuzz: **406 hostile strings, 405 refused, 1 accepted, 0 forged events**;
+  every emitted line still parses as exactly one JSON object.
+* *Editing, deleting, reordering or inserting a record.* All four are detected, with
+  the index of the first bad record reported.
+* *Whole-file rewrite.* Previously undetectable: measured on the Phase 2 code, a forged
+  4-record chain verified `(True, 4)` and a truncated one verified `(True, 1)`. Every
+  record is now signed, so a rewrite needs the signing key.
+* *Truncation.* A shorter valid chain is still a valid chain — this is stated plainly
+  because it surprised me. It is caught only by comparing against a head the operator
+  stored outside the state directory (`log_events_verify` with `expected_head`). A test
+  asserts both halves of that sentence.
+
+**Limits**
+
+* **No external anchor by default.** The head digest is exportable, but nothing ships
+  it off-box automatically. Without an operator doing that, truncation is invisible.
+* **Someone who can rewrite the file *and* read the signing key beside it is
+  undetectable.** There is no append-only sink and no transparency log. This is the
+  single strongest limit of goal 5 and it is not mitigated — only stated.
+* The signing key lives in the state directory next to the log it protects.
+* Validation is deliberately strict, so a legitimate deployment with unusual identifiers
+  (unicode names, long ids) would need the policy widened. Refusing is safe but not free.
+* One log per node; the logs of different nodes are not chained to each other.
+
+## P3-6. Security self-review findings
+
+| Area | Finding | Status |
+|---|---|---|
+| TOCTOU between check and apply | `protected_read` read policy with **no lock**, then recorded with one. A revocation in that window was missed, so a just-revoked actor could still be served a ciphertext and proof. | **Fixed**: single locked `protect_read()`; the two-step API is deleted and a test asserts it cannot return. |
+| Replayed/reordered notices | High-water mark per `(kind, publisher)`, strict advance | Covered by tests |
+| Rollback via old backups | Monotone high-water marks | Covered, with the state-dir limit stated |
+| Fault-injection reachability | Env only, scrubbed at import, five known names | Covered by a test that sends it as request fields |
+| Log injection | Validate-don't-sanitise + length-prefixed hashing | Fuzz-tested |
+| Partial-write windows | `os.replace` + fsync everywhere; intent record makes a torn rotation recoverable | Covered |
+| Lock scope | `read`, `rotate`, `recover`, `apply_notices`, `protect_read` all decide and write under one `flock` | Reviewed; `open_for_protected_read` was the one violation and is gone |
+| Bug found by acceptance run | `cluster_publish` never applied its own notice: the node that issued a revocation was the one node still honouring it | **Fixed** + regression test |
+| Mutation gap | Deleting `write_commit()` broke no test, because idempotent "finish forward" produced a correct end state | **Test added** asserting the cheap path is taken |
+
+## P3-7. Known limits of Phase 3
+
+1. **Keys still sit beside the data.** No KMS, no HSM, no at-rest wrapping. The state
+   directory is the trust boundary and everything above inherits that.
+2. **The signing key lives in the state directory**, next to the log it protects.
+3. **Simulated nodes share one machine**, so real network partitions, clock skew and
+   transport reordering are not tested. Propagation numbers are lower bounds.
+4. **No external log anchor by default**; an operator must store the head themselves.
+5. **Backup rollback marks are only as safe as the state directory.**
+6. **One publisher key is the sole cluster authority** — no quorum, no byzantine
+   tolerance.
+7. **Rotation is O(n) in assets** and not measured at scale.
+8. **Untested on macOS/Apple Silicon**; `docker build` still never executed here.
+9. **No Phase 4 work of any kind** was started.

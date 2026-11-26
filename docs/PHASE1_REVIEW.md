@@ -97,6 +97,14 @@ fallback path. The toolkit is never copied into this repo.
 | 11. Delivery under loss or reordering | No | not tested | No messaging layer in Phase 1. |
 | 12. Session resumption | No | not supported | No sessions; one process per request, policy re-checked every call. |
 
+> **This table is the Phase 1 state and is deliberately not updated.** It is a
+> snapshot of what existed before the messaging layer, kept so the Phase 1 claim is
+> auditable in its original form. For the current status of goals 9–12 see
+> `docs/SECURITY_NOTES.md` sections 3–11, which describe what Phase 2 actually
+> implements and tests: 9 (replay + recipient binding), 10 (forward secrecy via the
+> hybrid handshake), 11 (fragmentation under loss/reordering) and 12 (resumption,
+> with its budget-expiry limit stated).
+
 **Touched: 1, 2, 3, 5, 9 (all partial). Not covered: 4, 6, 7, 8, 10, 11, 12.**
 Nothing above is marked "measured" — a design description is not a measurement,
 and the evidence sheet's own rule says so.

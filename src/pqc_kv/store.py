@@ -292,6 +292,23 @@ class StateStore:
             self._write_state(state)
         return {}
 
+    def is_revoked(self, actor: str) -> bool:
+        """Public read-only query: is this actor disabled?
+
+        Added for Phase 2 so the messaging layer can honour a revocation without
+        reaching into private state. Takes the same lock as every other accessor.
+        An unknown actor is *not* revoked: revocation is an explicit act, and a name
+        that was never registered has nothing to be revoked from.
+        """
+        if not isinstance(actor, str) or not actor:
+            return False
+        try:
+            with self._locked():
+                state = self._read_state()
+        except StoreError:
+            return False
+        return actor in state.get("disabled", [])
+
     def audit(self, request_id: str) -> dict:
         if not isinstance(request_id, str):
             raise StoreError("malformed request id")

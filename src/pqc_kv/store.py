@@ -35,6 +35,11 @@ from .aead import NonceBudget
 from .keystore import KeyStore, ensure_private_dir, write_key_file, read_key_file
 
 SCHEMA = 1
+# Outcomes that are recorded in the audit log. `reject` is not a policy decision
+# the reader sees; it marks an attempt we refused to process (a reused request id).
+DECISION_ALLOW = "allow"
+DECISION_DENY = "deny"
+DECISION_REJECT = "reject"
 ASSET_CONTEXT = "pqc-kv/v1/asset-body"
 KEY_MATERIAL_CONTEXT = "pqc-kv/v1/synthetic-key-material"
 AUDIT_GENESIS = "0" * 64
@@ -247,11 +252,36 @@ class StateStore:
 
     # ------------------------------------------------------------ decisions
     def read(self, actor: str, asset: str, request_id: str) -> dict:
+        """Authorize a read. Returns only the decision (plus the body if allowed).
+
+        The *rule* that produced the decision is deliberately absent. adapter-v1.md
+        specifies `{"decision":"allow","body":...}` or `{"decision":"deny"}`, and a
+        rule label would answer a question the contract does not let the caller ask:
+        `owner_required` versus `unknown_asset` tells an unauthenticated caller which
+        asset ids exist. The rule is written to the audit record instead, where only
+        an operator can read it.
+
+        Request ids are single-use per event. A second read with a reused id is
+        refused rather than allowed to overwrite the first event's explanation,
+        because otherwise a caller could launder a past `allow` into a `deny` (or
+        the reverse) after the fact.
+        """
+        if not isinstance(request_id, str) or not request_id:
+            raise StoreError("malformed request id")
         with self._locked():
             state = self._read_state()
+            if request_id in state.get("events", {}):
+                # The attempt is recorded in full, but it does not touch the
+                # original event and it never evaluates policy.
+                self._record_duplicate(state, request_id, actor, asset)
+                self._write_state(state)
+                return {
+                    "decision": DECISION_DENY,
+                    "error": "request_id_reused",
+                }
             decision, rule, body = self._decide(state, actor, asset)
-            response: dict = {"decision": decision, "rule": rule}
-            if decision == "allow":
+            response: dict = {"decision": decision}
+            if decision == DECISION_ALLOW:
                 response["body"] = body
             self._record(state, request_id, actor, asset, decision, rule)
             self._write_state(state)
@@ -310,12 +340,40 @@ class StateStore:
         return actor in state.get("disabled", [])
 
     def audit(self, request_id: str) -> dict:
+        """Play back a recorded decision. Exactly two fields, as the contract says.
+
+        adapter-v1.md: "Return the recorded `request_id` and `decision` for that
+        read." This op is unauthenticated, so anything more is free reconnaissance:
+        naming the actor or the asset would confirm a guessed identifier exists, and
+        `explanation` spells out the policy rule. The full record is available to the
+        operator through :meth:`audit_detail` and the on-disk log, which are not
+        reachable from the adapter.
+
+        An unknown id still has to answer with a decision (the validator requires
+        `allow|deny`), so it answers `deny` -- the fail-closed label -- and nothing
+        else, making "never happened" indistinguishable from "denied".
+        """
+        if not isinstance(request_id, str) or not request_id:
+            raise StoreError("malformed request id")
+        state = self._read_state()
+        event = state.get("events", {}).get(request_id)
+        if not event:
+            return {"request_id": request_id, "decision": DECISION_DENY}
+        decision = event["decision"]
+        if decision not in (DECISION_ALLOW, DECISION_DENY):
+            # A refused duplicate is not an authorization decision; report it as the
+            # deny it effectively was rather than inventing a third label.
+            decision = DECISION_DENY
+        return {"request_id": event["request_id"], "decision": decision}
+
+    def audit_detail(self, request_id: str) -> dict:
+        """Operator view: rule, actor, asset, explanation. Never a body."""
         if not isinstance(request_id, str):
             raise StoreError("malformed request id")
         state = self._read_state()
         event = state.get("events", {}).get(request_id)
         if not event:
-            return {"request_id": request_id, "decision": "unknown", "error": "unknown_request"}
+            return {"request_id": request_id, "decision": DECISION_DENY, "error": "unknown_request"}
         return {
             "request_id": event["request_id"],
             "decision": event["decision"],
@@ -327,10 +385,37 @@ class StateStore:
             "audit_hash": event["audit_hash"],
         }
 
+    def audit_log_records(self) -> list[dict]:
+        """Every audit record, chain fields included. Read-only operator view."""
+        if not self.audit_path.exists():
+            return []
+        records = []
+        for raw in self.audit_path.read_text(encoding="utf-8").splitlines():
+            if not raw.strip():
+                continue
+            try:
+                records.append(json.loads(raw))
+            except ValueError:
+                raise StoreError("audit log corrupt") from None
+        return records
+
     def record_external(self, request_id: str, actor: str, asset: str, decision: str, rule: str) -> str:
-        """Record a decision the adapter made outside :meth:`read` (e.g. protected_read)."""
+        """Record a decision the adapter made outside :meth:`read` (e.g. protected_read).
+
+        Same single-use rule as :meth:`read`: a reused request id gets its own
+        `reject` record and never overwrites the first event. This matters more than
+        it looks, because `protected_read` derives its request id from actor+asset
+        when the caller supplies none, so repeats are the normal case rather than a
+        hostile one.
+        """
+        if not isinstance(request_id, str) or not request_id:
+            raise StoreError("malformed request id")
         with self._locked():
             state = self._read_state()
+            if request_id in state.get("events", {}):
+                digest = self._record_duplicate(state, request_id, actor, asset)
+                self._write_state(state)
+                return digest
             digest = self._record(state, request_id, actor, asset, decision, rule)
             self._write_state(state)
             return digest
@@ -363,6 +448,24 @@ class StateStore:
             "audit_hash": digest,
         }
         return digest
+
+    def _record_duplicate(self, state: dict, request_id: str, actor, asset) -> str:
+        """Record a refused attempt to reuse a request id.
+
+        It gets its own audit record with decision `reject`, so the operator sees the
+        attempt, and it deliberately does *not* touch `state["events"][request_id]`,
+        so the original decision keeps its original explanation.
+        """
+        record = {
+            "op": "read",
+            "request_id": str(request_id),
+            "actor": str(actor),
+            "asset": str(asset),
+            "decision": DECISION_REJECT,
+            "rule": "request_id_reused",
+            "ts": _now(),
+        }
+        return self._append_audit(state, record)
 
     def _append_audit(self, state: dict, record: dict) -> str:
         seq = int(state.get("audit_seq", 0)) + 1

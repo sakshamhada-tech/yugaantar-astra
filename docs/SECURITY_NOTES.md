@@ -203,11 +203,13 @@ forgot; it is a boundary we are declaring.
 
 **Limits**
 
-* The audit chain is **unkeyed SHA-256 with no external anchor**. An attacker who
-  can rewrite the entire file can recompute a valid chain. Log integrity (goal 5)
-  is therefore *partial*: tamper-evident against casual edits, not against a
-  determined attacker with write access. An HMAC keyed by a key stored elsewhere,
-  or an append-only remote sink, would be needed.
+* The audit chain was **unkeyed SHA-256 with no external anchor** through Phase 2:
+  an attacker who could rewrite the entire file recomputed a valid chain. Measured
+  before Phase 3: a full rewrite of 4 records verified `(True, 4)`, and truncation
+  to 1 record verified `(True, 1)`. Phase 3 adds an ML-DSA signature over the chain
+  head plus a `log_head` export for an external anchor -- see the Phase 3 section.
+  It remains *partial*: an attacker who can rewrite the file **and** read the
+  signing key in the same directory is still undetectable.
 * Auditing a read also writes state, so a full disk turns a read into an error.
   Deliberate: we prefer "cannot record ⇒ cannot serve".
 * No clock trust: timestamps are the host's, unsynchronised.
@@ -223,8 +225,12 @@ forgot; it is a boundary we are declaring.
 
 **Stops**
 
-* Deny-with-disclosure: deny responses contain only `{"decision":"deny"}` plus a
-  rule label that never reveals content or whether the asset exists.
+* Deny-with-disclosure: deny responses contain only `{"decision":"deny"}`. No rule
+  label, no field that varies with the reason. **Corrected in Phase 3:** through
+  Phase 2 this section claimed the rule label "never reveals... whether the asset
+  exists", which was false -- `owner_required` versus `unknown_asset` told an
+  unauthenticated caller exactly that. The label is now written only to the audit
+  record (`audit_detail`, operator-only).
 * Leaking internals on failure: `StoreError`, `KeyError`, `TypeError`,
   `ValueError` all collapse into `{"error": ...}` with a fixed vocabulary; no
   paths, no exception text, no stack traces. The adapter's `except` also prints a

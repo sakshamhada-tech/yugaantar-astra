@@ -36,9 +36,10 @@ def test_setup_reports_ready_and_writes_no_plaintext(tmp_path):
 def test_owner_can_read_exact_body(tmp_path):
     store = make_store(tmp_path)
     store.setup(dict(SETUP))
+    # Phase 3 / 3a: the response carries no rule label. The contract specifies only
+    # decision and body; the rule lives in the audit record (see test_phase3_fixes).
     assert store.read("maya", "brief", "r1") == {
         "decision": "allow",
-        "rule": "owner_allowed",
         "body": "lost-device synthetic body",
     }
 
@@ -54,8 +55,12 @@ def test_non_owner_denied_without_body(tmp_path):
 def test_unknown_asset_and_disabled_actor_denied(tmp_path):
     store = make_store(tmp_path)
     store.setup(dict(SETUP))
-    assert store.read("maya", "nope", "r3")["rule"] == "unknown_asset"
-    assert store.read("already-gone", "brief", "r4")["rule"] == "identity_revoked"
+    # Both denials are indistinguishable to the caller: that is the point of 3a.
+    assert store.read("maya", "nope", "r3") == {"decision": "deny"}
+    assert store.read("already-gone", "brief", "r4") == {"decision": "deny"}
+    # The operator can still tell them apart in the record.
+    assert store.audit_detail("r3")["rule"] == "unknown_asset"
+    assert store.audit_detail("r4")["rule"] == "identity_revoked"
 
 
 def test_revocation_persists_across_instances(tmp_path):
@@ -76,7 +81,7 @@ def test_audit_explains_denial(tmp_path):
     store.setup(dict(SETUP))
     store.revoke("maya")
     store.read("maya", "brief", "r7")
-    entry = make_store(tmp_path).audit("r7")
+    entry = make_store(tmp_path).audit_detail("r7")
     assert entry["request_id"] == "r7"
     assert entry["decision"] == "deny"
     assert entry["rule"] == "identity_revoked"
@@ -88,7 +93,9 @@ def test_audit_explains_denial(tmp_path):
 def test_unknown_audit_id(tmp_path):
     store = make_store(tmp_path)
     store.setup(dict(SETUP))
-    assert store.audit("never-happened")["decision"] == "unknown"
+    # `unknown` would be a third label the contract does not allow, and it would
+    # confirm the id was never used. Fail closed and answer `deny`.
+    assert store.audit("never-happened") == {"request_id": "never-happened", "decision": "deny"}
 
 
 def test_audit_chain_verifies_and_detects_edits(tmp_path):

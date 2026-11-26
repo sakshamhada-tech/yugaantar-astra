@@ -130,7 +130,6 @@ def _handle_protected_read(store: StateStore, request: dict) -> dict:
     import base64
 
     from pqc_kv import kem
-    from pqc_kv.symmetric import constant_time_equal
 
     try:
         peer_public = base64.b64decode(str(request["public_key"]).encode("ascii"), validate=True)
@@ -153,10 +152,6 @@ def _handle_protected_read(store: StateStore, request: dict) -> dict:
         (challenge + body).encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
-
-    # Self-check: recompute through the constant-time path so a mismatch would be
-    # an internal fault, never a timing signal to the caller.
-    assert constant_time_equal(mac, mac)
 
     store.record_external(request_id, actor, asset, "allow", rule)
     return {

@@ -946,4 +946,135 @@ meaningfully.
    tolerance.
 7. **Rotation is O(n) in assets** and not measured at scale.
 8. **Untested on macOS/Apple Silicon**; `docker build` still never executed here.
-9. **No Phase 4 work of any kind** was started.
+9. Detection (Phase 4) is a separate subsystem with its own limits; see §P4-6.
+
+
+---
+
+# Phase 4 — detection (goals 6, 7, 8)
+
+A rule-based detector over audit logs. No model, no weights, no learning: every alert
+is facts a reader can re-derive by hand. Full rule set, configuration and measurements
+are in `docs/DETECTION.md`; this section is the security review.
+
+## P4-1. What does this stop?
+
+| Attack | Rule | Stopped because |
+| --- | --- | --- |
+| Self-granted privilege escalation | `unapproved_privilege_change` | no approval record covers subject, role and time; the alert names which fact failed |
+| A subject approving its own change | `self_approved_privilege_change` | separation of duties is checked on both the subject path and the operator-ticket path |
+| Using a lesser ticket to justify a greater grant | role fact | the *granted* role must equal the ticket's role |
+| Using a genuine ticket after it expired | window fact | bounds are inclusive-start, **exclusive-end**, evaluated in corrected event time |
+| Lateral movement with valid credentials | `novel_service_edge`, `lateral_movement_chain` | first-seen edges, and chains that leave a freshly-reached service |
+| Reaching a crown-jewel service | `first_seen_sensitive_service` | operator-marked; empty by default |
+| Blast radius after an escalation | `follow_on_access_after_unapproved_change` | same-session access inside a configured window |
+| Sorting a report by unreliable clocks | goal 8 tolerance | an order is claimed only when the gap exceeds combined uncertainty; otherwise `order="uncertain"` |
+
+## P4-2. Hostile log fields (the brief's main demand)
+
+Validate, never sanitise — the Phase 3 rule, applied to a new input surface.
+
+* A field is accepted verbatim or the **whole event is quarantined** with a counted
+  reason and a line number. Nothing is truncated, stripped or silently dropped.
+* Narrow printable-ASCII charset. Non-ASCII refused: Cyrillic `а` vs Latin `a` is the
+  classic look-alike, and rewriting beats refusing only in the wrong direction.
+* Bounded: 96 chars per identity field, 64 per event id, 64 KB per line, 1 M events per
+  request. The line cap is checked **before** parsing, so a hostile 500 MB line costs
+  one comparison.
+* Alert **structure** is a closed key set in `alerts.py`, never derived from input. Ids
+  are content-derived, so a re-run cannot be mistaken for new activity.
+* 155 ingest tests, including 14 hostile values × 8 text columns, plus a 200-case random
+  byte fuzz asserting `parse` never raises.
+
+**One real limit, stated rather than hidden:** an unquoted newline in the *final* CSV
+column terminates the field. The row survives with a shorter value and the injected tail
+becomes an orphan line that is refused and counted. The injected text never becomes an
+event or an alert, but the surviving value is not the original. CSV cannot distinguish
+that from a legitimately short last field. Pinned by a test.
+
+## P4-3. Alert forgery
+
+The attack: `actor="user-a\n[ALERT] root login"` making the operator's terminal show
+two alerts. It fails at three independent points — ingest validation, the fixed alert
+schema, and content-derived ids. Asserted directly rather than assumed:
+
+```
+tests/test_phase4_properties.py::test_an_injected_message_cannot_add_an_alert_to_the_output
+tests/test_phase4_ingest.py::test_injected_text_never_appears_in_any_accepted_field
+tests/test_phase4_adapter.py::test_a_malformed_log_field_never_becomes_a_second_alert
+```
+
+Detections also reach the **signed** key-event log (action `detect`), so a high-severity
+finding becomes tamper-evident: editing a record breaks the chain and the signature,
+which was verified by tampering with a live log and watching `log_events_verify` return
+`chain_broken`. The log's field policy was **not** weakened to do this — the record
+carries `rule:alert_id`, both validated identifiers, never the prose explanation.
+
+## P4-4. Baseline poisoning
+
+An attacker who behaves badly during the baseline makes their later access
+non-novel. This is a **structural** limit of novelty detection, not a bug, and it is
+planted in the synthetic log to be *measured* rather than described: 3 events, labelled
+malicious, all missed. That is the single missed incident out of 13.
+
+Mitigations that exist: `min_baseline_events` (12, measured) keeps thin baselines from
+producing confident novelty claims; the baseline fraction is configurable; the run report
+states how many identities were `cold_start`. Mitigations that do **not** exist: any
+comparison against a known-good baseline from outside this log, or any way to detect that
+the baseline itself was written by an attacker. A deployment that needs that must feed
+the detector a baseline from a period it believes clean.
+
+## P4-5. Denial of service from huge logs or unbounded buffers
+
+* 1 M event cap per request, reported as `truncated` rather than silently applied.
+* Reorder buffer is capacity-bounded (4096). Measured: 100 023 events, **173 MB peak
+  RSS**, 36 944 events/s, 2.7 s — so the memory bound is a stated number, not a hope.
+* Per-identity graphs store sets of edges and targets, never events.
+* Rejection samples are capped at 20, so a fully hostile log cannot make the *report*
+  unbounded either. Verified with a 20 000-row garbage log: 20 000 rejected, 20 samples,
+  48 ms.
+* A file whose header row is missing or foreign is refused as `bad_header` and parsing
+  stops immediately, rather than rejecting every subsequent line one by one against
+  columns that were never declared. Fail-closed, and the reason names the file.
+* A single over-length line is refused before it is split (`line_too_long`, measured
+  0.3 ms for a 10 KB line), and impossible timestamps are refused per field.
+* An approvals file that cannot be read leaves detection running but is reported as
+  `context.document_error`. This was a **real bug found during this review**: a
+  structurally broken document used to produce an empty context indistinguishable from
+  "no change control was supplied", so every privilege change became unapproved and the
+  operator got a flood of alerts with nothing indicating the cause. Empty-but-valid and
+  absent are still both silent, because neither is an error.
+* The detector never writes outside `TRACK4_STATE_DIR`; the persisted baseline is
+  written with the Phase 3 atomic helper (`fsync` + `os.replace`) and holds counts and
+  membership only, never raw log text.
+
+## P4-6. Nondeterminism
+
+**None by construction.** No `time.time`, `datetime.now` or equivalent anywhere in
+`src/pqc_kv/detect/` — enforced by an AST walk, not a grep, because a docstring in
+`timing.py` says the words `time.time()` and a text search flagged the promise as a
+violation. Offset estimates are **causal** (past events only), so a batch run and a
+streaming run agree and there is no "final pass" that silently revises earlier answers.
+Alerts sort by `(event time, rule, alert id)`. Asserted by comparing two full runs
+byte-for-byte, and by running a log with its rows reversed.
+
+## P4-7. Known limits of Phase 4
+
+1. **Blind to unusual purpose, good at unusual shape.** An attacker who stays inside an
+   identity's established edges is invisible to the lateral rules.
+2. **Approval records are claims, not proof.** Compromise an approver — or file a real
+   ticket — and the privilege rules pass the change.
+3. **Baseline poisoning is undetected** (measured above).
+4. **Precision on real traffic is unknown.** 1.000 on my own synthetic corpus means that
+   corpus contains no benign case the rules mistake for an attack. It is a statement
+   about the corpus.
+5. **`min_baseline_events = 12` was tuned on synthetic data.** It was chosen by measuring
+   false-alert rates at 5/8/12/20/30 and taking the smallest value with zero false alerts;
+   a real deployment with different traffic shapes should re-measure it.
+6. **Clock uncertainty is a configured constant in `declared` mode**, not measured per
+   source. The `estimated` mode measures it, but a source with a wildly variable delay
+   becomes unorderable rather than analysed.
+7. **Throughput measured on 2 CPUs, Python 3.11.** The judged runtime is 3.12; this
+   sandbox could not install it.
+8. **Not run on macOS.** `unshare`-free operation is fine (the detector uses no such
+   facility), but "works on macOS" is untested here, as with Phase 3.

@@ -159,13 +159,21 @@ def test_copied_envelope_cannot_be_moved_to_another_asset(tmp_path):
     assert response["decision"] == "deny"
 
 
-def test_setup_rotates_keys_and_reseals(tmp_path):
+def test_setup_is_idempotent_and_keeps_reads_working(tmp_path):
+    """Phase 3 replaced Phase 1's key demolition with a versioned ring (goal 1).
+
+    Through Phase 2 this test asserted that `setup` deleted and re-created the
+    service keypair. That behaviour is exactly what goal 1 forbids: a rotation must
+    not orphan data. Keys now live in a ring and are rotated explicitly; `setup`
+    keeps version 1 and re-seals the assets, so a second setup still reads fine.
+    The rotation behaviour has its own tests in tests/test_phase3_rotation.py.
+    """
     store = make_store(tmp_path)
     store.setup(dict(SETUP))
-    before = (tmp_path / "pqc-kv-state" / "keys" / "kem-asset-store.key").read_bytes()
+    before = store.ring.summary()
     store.setup(dict(SETUP))
-    after = (tmp_path / "pqc-kv-state" / "keys" / "kem-asset-store.key").read_bytes()
-    assert before != after
+    after = store.ring.summary()
+    assert before["active_version"] == after["active_version"] == 1
     assert store.read("maya", "brief", "r10")["body"] == "lost-device synthetic body"
 
 

@@ -32,6 +32,7 @@ from pathlib import Path
 
 from . import envelope
 from .aead import NonceBudget
+from .keyring import ACTIVE, KeyRing, KeyRingError
 from .keystore import KeyStore, ensure_private_dir, write_key_file, read_key_file
 
 SCHEMA = 1
@@ -63,6 +64,9 @@ class StateStore:
         self.root = ensure_private_dir(Path(state_dir) / "pqc-kv-state")
         self.assets_dir = ensure_private_dir(self.root / "assets")
         self.keys = KeyStore(self.root / "keys")
+        # Service keys live in a versioned ring (goal 1). `self.keys` stays for the
+        # Phase 1 code paths that never version (synthetic material, messaging).
+        self.ring = KeyRing(self.root)
         self.state_path = self.root / "state.json"
         self.audit_path = self.root / "audit.jsonl"
         self.lock_path = self.root / ".lock"
@@ -145,6 +149,15 @@ class StateStore:
             # AES-GCM nonce budget honest: one key encrypts only the assets of one
             # setup. All ciphertexts are re-sealed here, so nothing is orphaned.
             recipient, signer = self._rotate_keys()
+            # Version 1 of the service key ring. After this, keys are only ever
+            # rotated (goal 1), never deleted and re-created like this.
+            if not self.ring.load()["entries"]:
+                self.ring.create_initial()
+            # Assets are sealed with the ring's active version, so open() can find
+            # the right keypair from the version stamped on each asset.
+            ring_version = self.ring.active().version
+            ring_kem = self.ring.kem_pair(ring_version)
+            ring_dsa = self.ring.dsa_pair(ring_version)
 
             # Reset policy + asset data.
             for stale in self.assets_dir.glob("*.env"):
@@ -162,7 +175,9 @@ class StateStore:
             for asset, body in contents.items():
                 if not isinstance(asset, str) or not isinstance(body, str):
                     raise StoreError("setup contents malformed")
-                asset_index[asset] = self._seal_asset(asset, body, recipient, signer)
+                asset_index[asset] = self._seal_asset(
+                    asset, body, ring_kem, ring_dsa, version=ring_version
+                )
 
             material = request.get("key_material")
             if isinstance(material, str) and material:
@@ -192,33 +207,49 @@ class StateStore:
                 "events": {},
                 "audit_head": AUDIT_GENESIS,
                 "audit_seq": 0,
+                "active_version": ring_version,
             }
             self._write_state(state)
         return {"ready": True}
 
-    def _rotate_keys(self):
-        """Drop any existing installation keys and create a new set.
+    #: Legacy, unversioned Phase 1 key labels. These are the only key files setup
+    #: may delete. Ring keys are `kem-service-vN.key` / `dsa-service-vN.key` and are
+    #: rotated explicitly (goal 1), never removed by setup -- a glob like
+    #: ``kem-*.key`` would match them and silently destroy the active version.
+    _LEGACY_KEY_FILES = ("kem-asset-store.key", "dsa-service.key")
 
-        Only meaningful together with re-sealing every asset, which setup does.
+    def _rotate_keys(self):
+        """Reset the *legacy* keypair used only for the synthetic material seal.
+
+        Phase 1 deleted every key here and re-sealed everything. That is the
+        demolition goal 1 exists to replace, so this now touches only the two
+        unversioned files and leaves the versioned ring alone.
         """
         self.keys._cache.clear()
-        for pattern in ("kem-*.key", "dsa-*.key", "hybrid-*.key"):
-            for stale in (self.root / "keys").glob(pattern):
-                try:
-                    stale.unlink()
-                except OSError:
-                    raise StoreError("cannot rotate keys") from None
+        for name in self._LEGACY_KEY_FILES:
+            stale = self.root / "keys" / name
+            try:
+                stale.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise StoreError("cannot reset legacy keys") from None
         recipient = self.keys.kem_keypair("asset-store")
         signer = self.keys.signing_keypair("service")
         return recipient, signer
 
-    def _seal_asset(self, asset: str, body: str, recipient, signer) -> dict:
+    def _recipient_label(self, asset: str, version: int) -> str:
+        """AAD-bound recipient label. The key version is part of the label, so an
+        envelope cannot be replayed as if it had been sealed under another version."""
+        return f"asset:{asset}#v{version}"
+
+    def _seal_asset(self, asset: str, body: str, recipient, signer, version: int = 1) -> dict:
         envelope_id = "asset-" + _digest(asset)[:16]
         sealed = envelope.seal(
             plaintext=body.encode("utf-8"),
             recipient_public=recipient,
             sender_signing_secret=signer.secret_key,
-            recipient="asset:" + asset,
+            recipient=self._recipient_label(asset, version),
             envelope_id=envelope_id,
             context=ASSET_CONTEXT,
             budget=self._budget,
@@ -229,18 +260,20 @@ class StateStore:
             "file": name,
             "envelope_id": envelope_id,
             "ciphertext_sha256": hashlib.sha256(sealed.ciphertext).hexdigest(),
+            "key_version": version,
         }
 
     def _open_asset(self, asset: str, entry: dict) -> str:
-        recipient = self.keys.kem_keypair("asset-store")
-        signer = self.keys.signing_keypair("service")
+        version = int(entry.get("key_version", 1))
+        recipient = self.ring.kem_pair(version)
+        signer = self.ring.dsa_pair(version)
         record = read_key_file(self.assets_dir / entry["file"])
         try:
             env = envelope.from_dict(json.loads(record["envelope"]))
         except (KeyError, TypeError, ValueError):
             raise StoreError("stored envelope unreadable") from None
         # AAD check: an envelope moved from another asset will not open.
-        if env.envelope_id != entry["envelope_id"] or env.recipient != "asset:" + asset:
+        if env.envelope_id != entry["envelope_id"] or env.recipient != self._recipient_label(asset, version):
             raise StoreError("stored envelope does not belong to this asset")
         try:
             body = envelope.open_envelope(
@@ -251,7 +284,7 @@ class StateStore:
         return body.decode("utf-8")
 
     # ------------------------------------------------------------ decisions
-    def read(self, actor: str, asset: str, request_id: str) -> dict:
+    def read(self, actor: str, asset: str, request_id: str, request_version: int | None = None) -> dict:
         """Authorize a read. Returns only the decision (plus the body if allowed).
 
         The *rule* that produced the decision is deliberately absent. adapter-v1.md
@@ -279,13 +312,45 @@ class StateStore:
                     "decision": DECISION_DENY,
                     "error": "request_id_reused",
                 }
-            decision, rule, body = self._decide(state, actor, asset)
+            # Goal 1: which key version is this request asking for? Default is the
+            # active version, which is what an ordinary caller means by "a read".
+            requested = state.get("active_version", 1)
+            asked = request_version if request_version is not None else requested
+            admitted = self._admit_version(state, asked)
+            if not admitted:
+                decision, rule, body = DECISION_DENY, "key_version_rejected", None
+            else:
+                decision, rule, body = self._decide(state, actor, asset)
             response: dict = {"decision": decision}
             if decision == DECISION_ALLOW:
                 response["body"] = body
             self._record(state, request_id, actor, asset, decision, rule)
             self._write_state(state)
             return response
+
+    def _admit_version(self, state: dict, version: int) -> bool:
+        """Enforce the rotation cutoff, and charge the grace budget when it applies.
+
+        A "*request using the old key*" in this adapter is a read whose
+        ``key_version`` names a ring version that is not the active one. Ordinary
+        reads do not name a version, so they always use the active one; the version
+        is named explicitly by an in-flight client that loaded an asset under version
+        N before rotation happened. That is the only kind of request the cutoff can
+        meaningfully affect, and it is the case tested end to end.
+        """
+        ring = self.ring.load()
+        try:
+            entry = self.ring.by_version(ring, version)
+        except KeyRingError:
+            return False
+        if entry.state == ACTIVE:
+            return True
+        if entry.state in ("retired", "revoked"):
+            return False
+        allowed, updated = self.ring.admit_read(version)
+        if updated is not ring:
+            self.ring.save(updated)
+        return allowed
 
     def _decide(self, state: dict, actor, asset):
         if not isinstance(actor, str) or not isinstance(asset, str):
@@ -321,6 +386,73 @@ class StateStore:
                 })
             self._write_state(state)
         return {}
+
+    def rotate(self, request: dict | None = None) -> dict:
+        """Create key version N+1 and re-protect every asset under it.
+
+        Ordering matters and is the reason an interrupted rotation is recoverable:
+
+            1. create version N+1 (active) -- new writes already have a home
+            2. re-wrap every asset, one at a time: open with the version recorded on
+               the asset, re-seal with N+1, update the index entry
+            3. only then mark N as *retiring* with its grace budget
+
+        Doing (3) last means a crash before step 2 finishes leaves N still active and
+        every asset still readable under whichever version its index entry names. No
+        asset is ever written with a version that does not exist yet, and no version
+        is retired before its data has moved.
+
+        This deliberately does **not** call ``setup()``: nothing here clears the
+        audit log, re-creates keys from scratch, or resets policy. A test asserts the
+        setup-only destructive hooks are never invoked.
+        """
+        request = request or {}
+        grace = int(request.get("grace", 2))
+        # Allow a re-run to finish an interrupted rotation before starting a new one.
+        self.recover()
+        with self._locked():
+            state = self._read_state()
+            before = state.get("active_version", 1)
+            old_entry, new_entry = self.ring.rotate(grace=grace)
+            ring_kem = self.ring.kem_pair(new_entry.version)
+            ring_dsa = self.ring.dsa_pair(new_entry.version)
+
+            resealed = 0
+            for asset, entry in list(state["assets"].items()):
+                body = self._open_asset(asset, entry)
+                state["assets"][asset] = self._seal_asset(
+                    asset, body, ring_kem, ring_dsa, version=new_entry.version
+                )
+                resealed += 1
+
+            state["active_version"] = new_entry.version
+            self._append_audit(state, {
+                "op": "rotate",
+                "actor": "",
+                "request_id": "",
+                "asset": "",
+                "decision": "rotate",
+                "rule": f"key_v{before}_to_v{new_entry.version}",
+                "ts": _now(),
+            })
+            self._write_state(state)
+        return {
+            "active_version": new_entry.version,
+            "retiring_version": old_entry.version,
+            "resealed": resealed,
+            "grace": grace,
+        }
+
+    def key_status(self) -> dict:
+        """Public description of the key ring. Versions and states, no key material."""
+        ring = self.ring.summary()
+        state = self._read_state()
+        ring["active_version"] = state.get("active_version", ring.get("active_version", 1))
+        return ring
+
+    def recover(self) -> dict:
+        """Placeholder until goal 3 adds the intent log. Returns a no-op report."""
+        return {"recovered": False, "active_version": self._read_state().get("active_version", 1)}
 
     def is_revoked(self, actor: str) -> bool:
         """Public read-only query: is this actor disabled?
@@ -480,6 +612,19 @@ class StateStore:
         state["audit_seq"] = seq
         state["audit_head"] = digest
         return digest
+
+    def log_head(self) -> dict:
+        """The current chain head, for an operator to anchor outside the state dir.
+
+        Without an anchor, a full rewrite of the log by someone with write access is
+        undetectable. With one, rewriting produces a head that does not match what
+        the operator wrote down. Phase 3 item 5 adds signing on top of this.
+        """
+        state = self._read_state()
+        return {
+            "audit_head": state.get("audit_head", AUDIT_GENESIS),
+            "audit_seq": int(state.get("audit_seq", 0)),
+        }
 
     def verify_audit_chain(self) -> tuple[bool, int]:
         """Re-derive every hash. Returns (ok, records_checked)."""

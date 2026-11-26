@@ -40,6 +40,10 @@ from pqc_kv.keystore import default_state_dir  # noqa: E402
 from pqc_kv.store import StateStore, StoreError  # noqa: E402
 
 SUPPORTED_OPS = {"setup", "read", "revoke", "audit", "protected_read"}
+# Phase 3: key lifecycle and log integrity. Additions, like the messaging ops: the
+# contract explicitly says the twelve goals include capabilities outside its
+# protected-resource interface.
+KEY_OPS = {"rotate", "key_status", "log_verify", "log_head"}
 # Phase 2: messaging operations are additions to, not replacements for, the five
 # contract operations. The adapter contract says the twelve goals include
 # capabilities outside its protected-resource interface, and explicitly notes that
@@ -66,6 +70,8 @@ def dispatch(request: dict) -> dict:
     op = request.get("op")
     if op in MESSAGING_OPS:
         return _dispatch_messaging(request)
+    if op in KEY_OPS:
+        return _dispatch_keys(request)
     if op not in SUPPORTED_OPS:
         return {"error": "unsupported_operation"}
 
@@ -103,7 +109,13 @@ def _handle_read(store: StateStore, request: dict) -> dict:
     request_id = request.get("request_id")
     if not isinstance(request_id, str) or not request_id:
         return {"error": "malformed_request"}
-    return store.read(request.get("actor"), request.get("asset"), request_id)
+    # Goal 1: `key_version` is how a request declares it is using an old key. Absent
+    # means "whatever is active", which is what an ordinary client means.
+    version = request.get("key_version")
+    if version is not None:
+        if not isinstance(version, int) or isinstance(version, bool):
+            return {"error": "malformed_request"}
+    return store.read(request.get("actor"), request.get("asset"), request_id, version)
 
 
 def _handle_protected_read(store: StateStore, request: dict) -> dict:
@@ -171,4 +183,30 @@ def _dispatch_messaging(request: dict) -> dict:
     except Exception:
         # Never surface a messaging reason code to the caller: `wrong_recipient`
         # vs `signature_invalid` would be an oracle. One answer, like Phase 1.
+        return {"error": "request_failed"}
+
+
+# --------------------------------------------------------------------- Phase 3
+def _dispatch_keys(request: dict) -> dict:
+    """Rotation and log-integrity operations. One opaque failure, as always."""
+    op = request.get("op")
+    try:
+        store = _store()
+        if op == "rotate":
+            grace = request.get("grace", 2)
+            if not isinstance(grace, int) or isinstance(grace, bool) or grace < 0:
+                return {"error": "malformed_request"}
+            return store.rotate({"grace": grace})
+        if op == "key_status":
+            return store.key_status()
+        if op == "log_verify":
+            ok, records = store.verify_audit_chain()
+            return {"ok": ok, "records": records}
+        if op == "log_head":
+            # Deliberately just the head digest: an operator stores this elsewhere
+            # and later proves the file has not been rewritten or truncated.
+            return store.log_head()
+        return {"error": "unsupported_operation"}
+    except Exception:
+        # Rotation can fail for many reasons; none of them is the caller's business.
         return {"error": "request_failed"}

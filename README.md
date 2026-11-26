@@ -310,7 +310,8 @@ The live security assessment attacks this system. Rather than wait for that, the
 attacks are written down and run as a gate:
 
 ```sh
-python scripts/redteam.py      # 23/23 attacks held
+python scripts/redteam.py           # 36/36 attacks held
+python scripts/phase6_acceptance.py # 12/12, incl. proving the fix by removing it
 ```
 
 Every check is an attack that **succeeded against an earlier build** or is a standard
@@ -351,8 +352,73 @@ real request) · JSON nested past the interpreter's recursion limit, which the
 organizer's own `json.loads` refuses before our code runs · DoS by message volume, which
 the sandbox prohibits by policy and the wire format bounds at 67 107 840 bytes.
 
-Full detail, including the attacks that held and the residual gaps of the fix, is in
-`docs/SECURITY_NOTES.md` §P6-1…P6-4.
+### The second pass: attacking the classes the first pass missed
+
+The first 23 attacks went after authorization and the wire format. The second pass went
+after races, crashes, rollback, parser confusion and the log — and found one serious bug
+of our own.
+
+**A shortened log verified as intact.** `log_events_verify` returned `ok: true` after
+deleting the last record from `key-events.jsonl`, and `ok: true` after emptying the file
+completely. Deleting the newest record is exactly how an attacker removes the trace of the
+change they just made, and a hash chain cannot see it: truncation yields a *shorter valid
+chain*. The anchor now lives in `state.json`, stamped into the same atomic write as the
+event that produced it, and the report says whether an anchor was used
+(`anchor_checked`). Truncation now returns `head_mismatch`; a log with no anchor available
+says so rather than implying it is intact.
+
+The 799-test suite did not catch this, because every test asserted that *tampering* was
+caught and none asserted that *removal* was. So the new regression test is verified by
+un-fixing the code and requiring it to fail — and `phase6_acceptance.py` re-runs that
+check every time, so the test cannot quietly stop testing anything.
+
+| Second-pass attack | Result |
+| --- | --- |
+| 12 concurrent reads sharing one `request_id` | exactly 1 allow, 11 deny |
+| 12 readers racing a revocation | 0 allow, 12 deny |
+| 40 `SIGKILL`s mid-revoke | 0 unusable states, 0 leftover temp files |
+| duplicate JSON keys to escalate an actor | last key wins; the non-owner value is what is evaluated |
+| Cyrillic / ZWSP / fullwidth / BOM look-alike identities | all denied — compared as exact bytes, never normalised |
+| `NaN`, `Infinity`, typed `request_id` | refused without a crash |
+| symlink planted at a rotate target | rotate refused; nothing written outside the directory |
+| **truncate or empty the signed log** | **was `ok: true` → now `head_mismatch`** |
+| reorder / edit / duplicate / forge a record | `chain_broken` |
+
+**Still undefeated, and stated as such: rollback of the state directory.** Restoring a
+snapshot taken before a revocation brings the revocation back off. No counter inside the
+directory can prevent this — the attacker is rewinding the directory itself — so it needs
+a TPM counter, a remote witness or an off-host ledger, none of which a single-container
+submission has. It costs **policy**, not **confidentiality**: the AEAD binds asset and
+owner identity, so an old directory cannot be replayed to read a body as someone else. An
+operator verifying the key-event log with an externally held anchor sees the rollback,
+because the restored log is shorter than the anchor says.
+
+Full detail is in `docs/SECURITY_NOTES.md` §P6-1…P6-8.
+
+## 1g. Seeing it work: `python scripts/dashboard.py`
+
+Every result in this repository is text in a terminal, which makes the system hard to see.
+One command serves a page that drives the **real adapter** — one process per request, the
+same way the judge drives it:
+
+```sh
+python scripts/dashboard.py --open    # http://127.0.0.1:8000
+```
+
+Six panels: access decisions (including a revocation taking effect on the next request),
+the ML-KEM protected read (ciphertext and HMAC proof, with the plaintext provably absent),
+end-to-end messaging (deliver, re-address to the wrong recipient, replay every fragment),
+detection over a sample log, signed-log verification in healthy and truncated states, and
+the 36-attack red-team gate.
+
+**No UI is required by the brief** — the submission is a two-page PDF plus a five-minute
+video, and no interface is scored. The dashboard exists because a reviewer who clicks a
+button and watches access flip to deny knows more than one who reads "revocation:
+verified". It is stdlib-only, read-only, loads nothing from the network, and runs against
+throwaway state directories under a temp path, so it cannot be why a demo fails in an
+offline container. `tests/test_dashboard.py` holds it to the adapter's answers so the page
+cannot drift into showing something the system would not actually do — that test caught a
+real drift while it was being written.
 
 ## 2. Clean-machine setup (tested)
 

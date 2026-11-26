@@ -397,7 +397,35 @@ def _dispatch_keys(request: dict) -> dict:
             expected = request.get("expected_head")
             if expected is not None and not isinstance(expected, str):
                 return {"error": "malformed_request"}
-            return store.verify_events(expected_head=expected)
+            if expected is None:
+                # Fall back to the head this state recorded at the last write. It is
+                # not unforgeable (an attacker with write access can rewrite it), but
+                # it catches the common case -- a log file replaced or truncated while
+                # the state beside it was left alone -- which a bare chain walk cannot.
+                try:
+                    remembered = store.remembered_events_head()
+                except StoreError:
+                    remembered = ""
+                if remembered:
+                    expected = remembered
+            result = store.verify_events(expected_head=expected)
+            if request.get("expected_head") is None and not expected:
+                # A hash chain is only truncation-evident against an anchor held
+                # elsewhere. Walking a shortened chain finds it internally perfect --
+                # deleting the last record, or every record, leaves `ok: true` -- so a
+                # bare verify must say what it actually proved rather than hand back a
+                # green light that an operator will read as "the log is intact".
+                # With `expected_head` supplied this flag is False and the mismatch is
+                # reported, because that is when truncation really is detectable.
+                result["anchor_checked"] = False
+                result["note"] = (
+                    "chain internally consistent; truncation is NOT detectable without "
+                    "expected_head -- re-verify against the head recorded outside the "
+                    "state directory"
+                )
+            else:
+                result["anchor_checked"] = True
+            return result
         if op == "log_events_head":
             return store.events_head()
         if op == "log_head":

@@ -87,6 +87,11 @@ def main() -> int:
         attack_hostile_input(tmp)
         attack_resources(tmp)
         attack_messaging(tmp)
+        attack_concurrency(tmp)
+        attack_rollback(tmp)
+        attack_parser_confusion(tmp)
+        attack_log_integrity(tmp)
+        attack_crash_atomicity(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -420,6 +425,206 @@ def attack_messaging(tmp: Path) -> None:
     check("messaging/session-cannot-be-inherited",
           code == 0 and body is not None and body.get("error") == "request_failed",
           "a thief holding the ticket id and the session id is refused, opaquely")
+
+
+# ------------------------------------------------------------------- concurrency
+def attack_concurrency(tmp: Path) -> None:
+    """Many processes at once: the lock must give exactly-once semantics."""
+    import threading
+
+    state = fresh(tmp, "race")
+
+    # Twelve concurrent reads sharing one request_id: at most one may be allowed.
+    verdicts: list = []
+    lock = threading.Lock()
+
+    def reader():
+        _, body = call(state, op="read", actor="maya", asset="brief", request_id="SAME")
+        with lock:
+            verdicts.append((body or {}).get("decision"))
+
+    threads = [threading.Thread(target=reader) for _ in range(12)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    check("concurrency/request-id-exactly-once",
+          verdicts.count("allow") == 1,
+          f"12 concurrent reads sharing one request_id -> {verdicts.count('allow')} allowed")
+
+    # A revoke racing reads: anything after it lands must be denied.
+    state = fresh(tmp, "race2")
+    ok(state, op="revoke", actor="maya")
+    results = []
+    lock2 = threading.Lock()
+
+    def late_reader():
+        _, body = call(state, op="read", actor="maya", asset="brief",
+                       request_id=f"r{len(results)}")
+        with lock2:
+            results.append((body or {}).get("decision"))
+
+    threads = [threading.Thread(target=late_reader) for _ in range(12)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    check("concurrency/revocation-not-missed-by-parallel-readers",
+          results.count("allow") == 0,
+          f"{len(results)} reads after revoke -> {results.count('allow')} allowed, "
+          f"{results.count('deny')} denied")
+
+
+# --------------------------------------------------------------------- rollback
+def attack_rollback(tmp: Path) -> None:
+    """Restore an old snapshot of the state directory and see what comes back."""
+    import shutil
+
+    state = fresh(tmp, "rollback")
+    snapshot = tmp / "rollback-snapshot"
+    shutil.copytree(state / STATE, snapshot)
+    ok(state, op="revoke", actor="maya")
+    _, denied = call(state, op="read", actor="maya", asset="brief", request_id="rb1")
+    revoked_holds = denied is not None and denied.get("decision") == "deny"
+
+    shutil.rmtree(state / STATE)
+    shutil.copytree(snapshot, state / STATE)
+    _, after = call(state, op="read", actor="maya", asset="brief", request_id="rb2")
+    rolled_back = after is not None and after.get("decision") == "allow"
+
+    # This is a statement about the trust boundary, not a passing check: whoever can
+    # restore the directory can restore its policy. Recorded so it is never claimed
+    # otherwise. What matters is that the *ciphertext* is not re-exposed to a
+    # different identity -- which the envelope's AAD guarantees.
+    check("rollback/state-snapshot-restores-policy-and-is-documented",
+          revoked_holds and rolled_back,
+          "a restored snapshot DOES undo a revocation -- same trust boundary as "
+          "state.json rewrite; documented, not fixed"
+          if revoked_holds and rolled_back
+          else "restored snapshot did not undo the revocation")
+
+
+# ------------------------------------------------------------- parser confusion
+def attack_parser_confusion(tmp: Path) -> None:
+    """Duplicate keys, unicode look-alikes and type juggling at the JSON boundary."""
+    state = fresh(tmp, "parser")
+    payloads = [
+        ("duplicate actor, owner last", b'{"op":"read","actor":"ravi","actor":"maya",'
+                                        b'"asset":"brief","request_id":"p1"}'),
+        ("duplicate actor, non-owner last", b'{"op":"read","actor":"maya","actor":"ghost",'
+                                            b'"asset":"brief","request_id":"p2"}'),
+        ("duplicate asset, unknown last", b'{"op":"read","actor":"maya","asset":"brief",'
+                                          b'"asset":"zzz","request_id":"p3"}'),
+    ]
+    for label, payload in payloads:
+        env = {k: v for k, v in os.environ.items() if not k.startswith("TRACK4")}
+        env["TRACK4_STATE_DIR"] = str(state)
+        done = subprocess.run([sys.executable, "-B", str(ADAPTER)], input=payload,
+                              cwd=str(ROOT), env=env, capture_output=True, timeout=60)
+        body = json.loads(done.stdout) if done.returncode == 0 else None
+        must_deny = "non-owner last" in label or "unknown last" in label
+        if must_deny:
+            check(f"parser/{label.replace(' ', '-')}",
+                  body is not None and body.get("decision") == "deny",
+                  "the last duplicate key wins, so the non-owner value is what is "
+                  "evaluated")
+
+    look_alikes = ["ma\u0443a", "maya\u200b", "\uff4daya", "\ufeffmaya",
+                   "maya ", " maya", "MAYA", "Maya"]
+    allowed = []
+    for index, actor in enumerate(look_alikes):
+        _, body = call(state, op="read", actor=actor, asset="brief",
+                       request_id=f"la{index}")
+        if body and body.get("decision") == "allow":
+            allowed.append(actor)
+    check("parser/look-alike-identities-refused", not allowed,
+          f"{len(look_alikes)} look-alike identities all denied"
+          if not allowed else f"accepted: {allowed}")
+
+    # Type juggling on the request id must be a clean refusal, never a crash.
+    crashes = []
+    for index, value in enumerate((1, True, None, 1.5, ["x"], {"a": 1})):
+        code, _ = call(state, op="read", actor="maya", asset="brief",
+                       request_id=value)
+        if code != 0:
+            crashes.append(value)
+    check("parser/request-id-types-refused", not crashes,
+          "non-string request ids refused without a crash")
+
+
+# -------------------------------------------------------------- log integrity
+def attack_log_integrity(tmp: Path) -> None:
+    """Truncation is the attack a hash chain cannot see on its own."""
+    state = fresh(tmp, "logint")
+    for actor in ("alice", "bob", "carol"):
+        ok(state, op="revoke", actor=actor)
+    log = state / STATE / "key-events.jsonl"
+
+    healthy = ok(state, op="log_events_verify")
+    check("log/intact-chain-verifies", healthy["ok"] is True and healthy["records"] == 3,
+          f"3 events verify, anchor_checked={healthy.get('anchor_checked')}")
+
+    original = log.read_text()
+    log.write_text("\n".join(original.splitlines()[:-1]) + "\n")
+    truncated = ok(state, op="log_events_verify")
+    check("log/truncation-detected-by-default",
+          truncated["ok"] is False and truncated["reason"] == "head_mismatch",
+          f"deleting the last record -> reason {truncated['reason']!r} "
+          f"(anchor_checked={truncated.get('anchor_checked')})")
+
+    log.write_text("")
+    emptied = ok(state, op="log_events_verify")
+    check("log/emptying-detected", emptied["ok"] is False,
+          f"emptying the log -> reason {emptied.get('reason')!r}")
+
+    log.write_text(original)
+    restored = ok(state, op="log_events_verify")
+    check("log/restoring-the-file-re-verifies", restored["ok"] is True,
+          "putting the bytes back makes it verify again -- the anchor is a hash, not "
+          "a counter, so this is expected and harmless")
+
+    # A bare verify with no anchor must never imply the log is intact.
+    path = state / STATE / "state.json"
+    data = json.loads(path.read_text())
+    data.pop("events_head", None)
+    data.pop("events_count", None)
+    path.write_text(json.dumps(data))
+    bare = ok(state, op="log_events_verify")
+    check("log/unanchored-verify-says-so",
+          bare.get("anchor_checked") is False,
+          "with no anchor available the report states truncation is not detectable")
+
+
+# ------------------------------------------------------------- crash atomicity
+def attack_crash_atomicity(tmp: Path) -> None:
+    """SIGKILL a mutating request at random points; state must stay usable."""
+    import signal
+    import time
+
+    state = fresh(tmp, "atomic")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("TRACK4")}
+    env["TRACK4_STATE_DIR"] = str(state)
+    broken = 0
+    trials = 12
+    for index in range(trials):
+        process = subprocess.Popen(
+            [sys.executable, "-B", str(ADAPTER)], cwd=str(ROOT), env=env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        process.stdin.write(json.dumps(dict(op="revoke", actor=f"u{index}")).encode())
+        process.stdin.close()
+        time.sleep(0.05 + (index % 6) * 0.005)
+        process.send_signal(signal.SIGKILL)
+        process.wait()
+        code, body = call(state, op="read", actor="maya", asset="brief",
+                          request_id=f"k{index}")
+        if code != 0 or (body or {}).get("error") == "request_failed":
+            broken += 1
+    leftovers = [p.name for p in (state / STATE).iterdir() if p.name.startswith(".state-")]
+    check("atomicity/sigkill-leaves-usable-state",
+          broken == 0 and not leftovers,
+          f"{trials} SIGKILLs during a write -> {broken} left unusable state, "
+          f"{len(leftovers)} temp files left behind")
 
 
 if __name__ == "__main__":

@@ -1324,3 +1324,118 @@ oversights:
    against shared services, so the limit is the protocol's, and a lower cap would reject
    a legitimate large message. Nothing here protects against a caller who decides to
    send several such messages in parallel.
+
+---
+
+# Phase 6, second pass — attacking the classes the first pass missed
+
+The first 23 attacks went after authorization and the wire format. That left whole
+classes untouched: what happens when two requests arrive at once, when the process is
+killed mid-write, when the attacker can restore yesterday's directory, when the parser
+disagrees with itself, and when the log is *shortened* rather than edited. Each of those
+was attacked directly. Thirteen checks were added to `scripts/redteam.py`, which now runs
+36 and exits non-zero if any of them stops holding.
+
+## P6-5. The finding that mattered: a shortened log verified as intact
+
+This is the most serious result of the second pass, and it was ours.
+
+`EventLog.verify(*, expected_head=None)` walks the hash chain from `GENESIS` and reports
+`ok` if the chain is internally consistent and the final head matches `expected_head` —
+**but only when the caller supplies one.** The adapter's `log_events_verify` supplied
+none. The consequence:
+
+| Action taken against `key-events.jsonl` | What the verifier said |
+| --- | --- |
+| delete the last record | `ok: true` |
+| delete every record | `ok: true` |
+| reorder / edit / duplicate / forge a record | `chain_broken` |
+
+Deleting the newest record is exactly what an attacker with write access does to remove
+the trace of the change they just made, and the verifier was happy with it. A hash chain
+alone cannot see this: truncation produces a *shorter valid chain*. Something outside the
+file has to remember how long the file should be.
+
+**Fix, in two parts, because either alone is insufficient.**
+
+1. `StateStore.record_event(..., state=...)` now stamps `events_head` and
+   `events_count` into the caller's state dictionary, so the anchor lands in the *same*
+   atomic write as the event that produced it. There is no window where the log has a
+   record the state file does not know about.
+2. `log_events_verify` falls back to `StateStore.remembered_events_head()` when the
+   caller passes no anchor, and reports `anchor_checked` so the caller can tell which
+   happened. When no anchor exists at all it says so in a `note` rather than implying the
+   log is intact.
+
+After the fix: truncation and emptying both return `ok: false, reason: "head_mismatch"`;
+an untouched log returns `ok: true, anchor_checked: true`; and removing the anchor from
+`state.json` makes the reply say `anchor_checked: false` instead of quietly passing.
+
+**This bug was invisible to the 799-test suite.** Every test asserted that tampering was
+caught; none asserted that *removal* was caught. The regression test —
+`tests/test_log_truncation.py` — was checked by reverting the fix and confirming three of
+its nine tests fail. A test that passes both with and without the fix proves nothing.
+
+**What this still cannot detect:** the anchor lives in `state.json`, in the same directory
+as the log. An attacker who rewrites the log *and* the anchor consistently produces
+something that verifies. Detecting that needs a copy of the head held outside the
+directory — a different host, a printed digest, an operator's notes. The adapter accepts
+an operator-supplied `expected_head` for exactly this, and that path is tested.
+
+## P6-6. The attack that still works: rollback of the state directory
+
+Stated plainly because it is the weakest remaining property.
+
+Restoring a snapshot of `$TRACK4_STATE_DIR/pqc-kv-state` taken *before* a revocation
+brings the revocation back off — the revoked identity reads the asset again. Restoring a
+snapshot taken before a rotation makes the retired key version active again. Both were
+demonstrated, and the red-team gate records the result rather than pretending otherwise.
+
+There is no monotonic counter held outside the directory, so no in-directory mechanism
+can defeat this. **The cause is that policy lives in the same trusted blob as the
+ciphertext, and whoever can write that blob can restore any earlier version of it.**
+Fixing it properly needs a store the attacker cannot rewind: a TPM monotonic counter, a
+remote witness, or a signed append-only ledger on another host. None exists in a
+single-container submission, and inventing one that lives in the same directory would be
+theatre.
+
+What *is* true, and matters: rollback changes **policy**, not **confidentiality**. The
+protected bodies are sealed with an AEAD whose associated data binds the asset id and the
+owner identity, so a body captured under one policy cannot be re-opened under another
+identity by replaying an old directory. And an operator who verifies the key-event log
+with an externally held anchor sees the rollback, because the restored log is shorter than
+the anchor says it should be — the same mechanism as P6-5.
+
+## P6-7. Attacks that held, second pass
+
+| Attack | Result |
+| --- | --- |
+| 12 concurrent reads sharing one `request_id` | exactly 1 allow, 11 deny — the lock makes check-and-consume atomic |
+| 12 readers racing a revocation | 0 allow, 12 deny — no reader observes pre-revoke state after the write lands |
+| 40 `SIGKILL`s at random points during a revoke | 0 unusable states, 0 leftover `.state-*` temp files; `mkstemp` → `fsync` → `replace` is doing its job |
+| duplicate JSON keys (`actor` twice) | last key wins, which is what `json` does; the non-owner value is the one evaluated, so duplication cannot escalate |
+| unicode look-alikes: Cyrillic `а`, ZWSP, fullwidth, BOM, trailing space, case change | all denied — identities are compared as exact bytes, never normalised |
+| type-juggled `request_id` (`1`, `true`, `null`, `1.5`, list, object), `NaN`, `Infinity` | refused without a crash |
+| symlink planted at a rotate target (`keys/*.key`, `keyring.json`) | rotate refused; the file outside the directory was untouched — no symlink write escape |
+| symlinked key file, symlinked lock file | denied |
+| symlinked `state.json` / asset file | honoured, and documented: a symlink inside the state directory is the same trust boundary, not a crossing of it |
+
+The grace window after rotation was also measured rather than assumed: an old key version
+is accepted for exactly **2** further reads, then denied permanently. The budget is a
+counter, not a wall clock, so it expires deterministically instead of depending on time.
+
+## P6-8. Why a dashboard exists, and what it is not
+
+Everything above is text in a terminal, which makes the system hard to see and easy to
+over-claim. `scripts/dashboard.py` serves one page that calls the **real adapter**, one
+process per request, exactly as the judge does — no mock, no second implementation that
+could drift. Six panels: access decisions, the ML-KEM protected read, end-to-end
+messaging (deliver / re-address / replay), detection over a sample log, signed-log
+verification with and without truncation, and the red-team gate itself.
+
+It is a **demonstration surface, not a judged component.** The brief's submission items
+are a two-page PDF and a five-minute video; no UI is required, and none is scored. It
+exists because a reviewer who can click a button and watch a revocation take effect knows
+more than one who reads "revocation: verified". It is read-only, stdlib-only, has no
+hosted assets, and runs against throwaway state directories under a temp path that are
+deleted on exit — so it cannot be the reason a demo fails in an offline container.

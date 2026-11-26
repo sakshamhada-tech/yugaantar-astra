@@ -414,7 +414,7 @@ class StateStore:
                 # Monotonic counter; the rollback check for backups compares it.
                 state["revocation_seq"] = int(state.get("revocation_seq", 0)) + 1
                 self._write_state(state)
-                self.record_event("revoke", actor if _safe_actor(actor) else "")
+                self.record_event("revoke", actor if _safe_actor(actor) else "", state=state)
                 self._append_audit(state, {
                     "op": "revoke",
                     "actor": actor,
@@ -499,7 +499,7 @@ class StateStore:
             intent.clear(self.root)
             # Goal 5: every rotation is a key event. Written after the commit so a
             # crash cannot leave an event for a rotation that did not happen.
-            self.record_event("rotate", "", f"v{before}-to-v{new_entry.version}")
+            self.record_event("rotate", "", f"v{before}-to-v{new_entry.version}", state=state)
         return {
             "active_version": new_entry.version,
             "retiring_version": old_entry.version,
@@ -634,7 +634,7 @@ class StateStore:
                 "ts": _now(),
             })
             self._write_state(state)
-            self.record_event("restore", "", f"keys-{len(payload)}")
+            self.record_event("restore", "", f"keys-{len(payload)}", state=state)
         return {"restored": sorted(payload), "count": len(payload)}
 
     def recovery_pending(self) -> bool:
@@ -711,7 +711,7 @@ class StateStore:
                 "op": "recover", "to_version": entry.version, "resealed": completed,
             })
             intent.clear(self.root)
-            self.record_event("recover", "", f"to-v{entry.version}")
+            self.record_event("recover", "", f"to-v{entry.version}", state=state)
         return {
             "recovered": True,
             "action": "completed",
@@ -928,22 +928,71 @@ class StateStore:
         pair = KeyStore(self.root / "log-identity").signing_keypair("eventlog")
         return logsign.EventLog(self.root / "key-events.jsonl", pair.secret_key, pair.public_key)
 
-    def record_event(self, action: str, actor: str = "", detail: str = "") -> dict:
-        """Append a signed key event. Refuses hostile identifiers outright."""
+    def record_event(self, action: str, actor: str = "", detail: str = "",
+                     state: dict | None = None) -> dict:
+        """Append a signed key event, and remember the resulting head.
+
+        The head is written into `state.json` after every append so that
+        `log_events_verify` can anchor against it without an operator having to
+        remember anything. This does **not** make truncation unforgeable -- an attacker
+        who can write the state directory can rewrite `events_head` too -- but it
+        separates two cases that used to look identical:
+
+        * an anchored head that still matches: the log is consistent *and* is the one
+          this state expects;
+        * an anchored head that does not: the log was replaced or truncated.
+
+        The unforgeable version needs an anchor outside the state directory, which is
+        what the operator's `expected_head` provides. Both are supported.
+        """
         from . import logsign
 
-        state = self._read_state()
-        detail = detail or f"v{int(state.get('active_version', 1))}"
+        # NOTE: do NOT rebind `state` here. It is the caller's dict, and shadowing it
+        # with a fresh read silently discarded every head stamp -- which is exactly
+        # what a first version of this function did.
+        current = state if state is not None else self._read_state()
+        detail = detail or f"v{int(current.get('active_version', 1))}"
         try:
-            return self._event_log().append(action=action, actor=actor, detail=detail)
+            record = self._event_log().append(action=action, actor=actor, detail=detail)
         except logsign.LogError:
             # Never write a record we could not validate; the caller decides what to
             # do. The audit log still has the raw attempt.
             raise StoreError("event rejected") from None
+        # Stamp the head into the caller's in-memory state rather than writing a
+        # second copy. Callers hold the lock and write `state` themselves after this
+        # returns, so a write here would be discarded -- and worse, would persist a
+        # state that later got overwritten. Passing `state` keeps the event and the
+        # head in one atomic update.
+        if state is not None:
+            try:
+                head, count = self._event_log().head()
+                state["events_head"] = head
+                state["events_count"] = count
+            except (StoreError, OSError):
+                # The event is already durably appended; failing to remember its head
+                # must not fail the operation that caused it.
+                pass
+        return record
+
+    def remember_events_head(self, state: dict) -> None:
+        """Stamp the current head into a state dict the caller is about to write."""
+        try:
+            head, count = self._event_log().head()
+        except Exception:
+            return
+        state["events_head"] = head
+        state["events_count"] = count
 
     def verify_events(self, expected_head: str | None = None) -> dict:
         """Full chain + signature walk, optionally against a remembered head."""
         return self._event_log().verify(expected_head=expected_head)
+
+    def remembered_events_head(self) -> str:
+        """The head recorded in state.json at the last event write, or ""."""
+        try:
+            return str(self._read_state().get("events_head") or "")
+        except StoreError:
+            return ""
 
     def events_head(self) -> dict:
         head, count = self._event_log().head()

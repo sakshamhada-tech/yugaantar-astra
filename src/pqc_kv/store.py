@@ -34,7 +34,9 @@ from . import envelope
 from .aead import NonceBudget
 from . import intent
 from .keyring import ACTIVE, KeyRing, KeyRingError
-from .keystore import KeyStore, ensure_private_dir, write_key_file, read_key_file
+from .keystore import (
+    KeyStore, b64d, b64e, ensure_private_dir, read_key_file, write_key_file,
+)
 
 SCHEMA = 1
 # Outcomes that are recorded in the audit log. `reject` is not a policy decision
@@ -209,6 +211,7 @@ class StateStore:
                 "audit_head": AUDIT_GENESIS,
                 "audit_seq": 0,
                 "active_version": ring_version,
+                "revocation_seq": 0,
             }
             self._write_state(state)
         return {"ready": True}
@@ -376,6 +379,8 @@ class StateStore:
             state = self._read_state()
             if actor not in state["disabled"]:
                 state["disabled"].append(actor)
+                # Monotonic counter; the rollback check for backups compares it.
+                state["revocation_seq"] = int(state.get("revocation_seq", 0)) + 1
                 self._append_audit(state, {
                     "op": "revoke",
                     "actor": actor,
@@ -523,6 +528,7 @@ class StateStore:
                     actor = str(parsed["payload"].get("actor", ""))
                     if actor and actor not in state["disabled"]:
                         state["disabled"].append(actor)
+                        state["revocation_seq"] = int(state.get("revocation_seq", 0)) + 1
                         self._append_audit(state, {
                             "op": "revoke", "actor": actor, "request_id": "", "asset": "",
                             "decision": "revoke", "rule": "identity_revoked_remote", "ts": _now(),
@@ -541,6 +547,57 @@ class StateStore:
                 applied.append(result)
             self._write_state(state)
         return {"applied": len(applied), "rejected": len(rejected), "reasons": rejected}
+
+    def create_backup(self, secret: bytes, signer=None) -> dict:
+        """Seal the key material into one authenticated blob. Operator supplies the key."""
+        from . import backup
+
+        if signer is None:
+            signer = self.ring.dsa_pair(self.ring.active().version).secret_key
+        state = self._read_state()
+        payload = {}
+        for name in self.ring.key_files():
+            path = self.ring.keys_dir / name
+            payload[name] = b64e(path.read_bytes())
+        return backup.create_backup(
+            payload=payload,
+            secret=secret,
+            signing_key=signer,
+            key_version=int(state.get("active_version", 1)),
+            key_ids=sorted(payload),
+            revocation_seq=int(state.get("revocation_seq", 0)),
+            log_head=str(state.get("audit_head", AUDIT_GENESIS)),
+        )
+
+    def restore_backup(self, blob: dict, secret: bytes, signing_public: bytes) -> dict:
+        """Verify a backup, then install it. Nothing is written before verification.
+
+        The high-water marks come from *this* node's state. See backup.py for why a
+        fresh directory cannot defend against rollback without an external anchor.
+        """
+        from . import backup
+
+        state = self._read_state()
+        high_water = backup.high_water_from_state(state)
+        # open_backup raises on anything it does not fully trust, so the payload we
+        # get back has already passed signature, rollback and GCM checks.
+        payload = backup.open_backup(
+            blob, secret=secret, signing_public=signing_public, high_water=high_water
+        )
+        with self._locked():
+            for name, encoded in payload.items():
+                if "/" in str(name) or "\\" in str(name) or str(name).startswith("."):
+                    raise StoreError("backup contains an unsafe key name")
+                target = self.ring.keys_dir / str(name)
+                write_key_file(target, json.loads(b64d(encoded).decode("utf-8")))
+            state = self._read_state()
+            self._append_audit(state, {
+                "op": "restore", "actor": "", "request_id": "", "asset": "",
+                "decision": "restore", "rule": f"keys_v{int(state.get('active_version', 1))}",
+                "ts": _now(),
+            })
+            self._write_state(state)
+        return {"restored": sorted(payload), "count": len(payload)}
 
     def recovery_pending(self) -> bool:
         return False

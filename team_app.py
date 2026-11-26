@@ -52,7 +52,8 @@ SUPPORTED_OPS = {"setup", "read", "revoke", "audit", "protected_read"}
 # contract explicitly says the twelve goals include capabilities outside its
 # protected-resource interface.
 KEY_OPS = {"rotate", "key_status", "log_verify", "log_head", "recover",
-           "cluster_publish", "cluster_sync", "cluster_status"}
+           "cluster_publish", "cluster_sync", "cluster_status",
+           "backup_create", "backup_restore"}
 # Phase 2: messaging operations are additions to, not replacements for, the five
 # contract operations. The adapter contract says the twelve goals include
 # capabilities outside its protected-resource interface, and explicitly notes that
@@ -213,6 +214,30 @@ def _dispatch_keys(request: dict) -> dict:
             return status
         if op == "recover":
             return store.recover()
+        if op == "backup_create":
+            # The operator supplies the key. It is used for this call and dropped; it
+            # is never written to the state directory and never logged.
+            secret = _decode_secret(request.get("backup_key"))
+            if secret is None:
+                return {"error": "malformed_request"}
+            return {"backup": store.create_backup(secret)}
+        if op == "backup_restore":
+            secret = _decode_secret(request.get("backup_key"))
+            blob = request.get("backup")
+            if secret is None or not isinstance(blob, dict):
+                return {"error": "malformed_request"}
+            from pqc_kv.keystore import b64d as _b64d
+
+            try:
+                signing_public = _b64d(str(request.get("signing_public", "")))
+            except Exception:
+                return {"error": "malformed_request"}
+            try:
+                return store.restore_backup(blob, secret, signing_public)
+            except Exception:
+                # A damaged, tampered or stale backup is one opaque failure. The
+                # operator's own script can tell them apart from the log.
+                return {"error": "backup_refused"}
         if op == "log_verify":
             ok, records = store.verify_audit_chain()
             return {"ok": ok, "records": records}
@@ -265,3 +290,16 @@ def _dispatch_keys(request: dict) -> dict:
     except Exception:
         # Rotation can fail for many reasons; none of them is the caller's business.
         return {"error": "request_failed"}
+
+
+def _decode_secret(value) -> bytes | None:
+    """Decode the operator's backup key from base64. Never echoed, never stored."""
+    if not isinstance(value, str):
+        return None
+    import base64 as _b64
+
+    try:
+        secret = _b64.b64decode(value.encode("ascii"), validate=True)
+    except Exception:
+        return None
+    return secret if len(secret) >= 16 else None

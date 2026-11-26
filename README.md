@@ -256,6 +256,54 @@ the privilege rules pass. Precision of 1.000 is precision on my own synthetic co
 Full list in `docs/SECURITY_NOTES.md` §P4-7; rules, evasions and measurements in
 `docs/DETECTION.md`.
 
+## 1e. Phase 5 — messaging goals 9-12, attacked rather than asserted
+
+Phase 2 built these four features; Phase 5 exists because the brief states them as
+*attacks to survive*, not features to have. Each check below mounts the attack the
+brief names and shows the system refusing it. Nothing new was needed in the protocol —
+what was missing was proof, and in three places the proof was genuinely absent.
+
+```sh
+python scripts/phase5_acceptance.py
+```
+
+Real subprocesses through `track4_service.py`, one per request. Last run:
+**17 passed, 0 failed.** Exit code is non-zero on failure.
+
+| Goal | The brief's sentence | How it is tested |
+| --- | --- | --- |
+| 9. Replay + recipient binding | "rejects duplicate messages and messages whose authenticated recipient information has changed" | recipient user and fingerprint are rewritten and each must fail **as `wrong_recipient`**, not merely fail; the genuine fragments still deliver afterwards; a full replay delivers 0 and counts 5 duplicates |
+| 10. Forward secrecy | "later exposure of a long-term identity key alone does not reveal earlier sessions" | complete a session, then derive the root holding **every** long-term secret of both parties plus the full public transcript, and show no root or chain key matches |
+| 11. Delivery under loss | "delivers complete, authenticated messages when recovery succeeds; discards incomplete ones and reports failures" | half the fragments → 0 delivered with `incomplete` and the message id; the rest reversed → exact body; a forged fragment is *reported*, and must not desynchronise the ratchet |
+| 12. Session resumption | "a different identity cannot inherit the session by presenting the same session identifier" | a thief holding the ticket **and** the session id, with its own key, is refused; a genuine ticket against another session id is refused; the right peer resumes and the spent ticket is deleted |
+
+### Why Phase 5 needed new tests, not just a new gate
+
+The Phase 2 suite passed 181 tests before this phase and still had three real holes,
+each at the point the brief is most adversarial:
+
+1. **Goal 10 had no test at all.** The suite tested that ephemeral files get erased —
+   the *mechanism* — and never tested that earlier sessions stay unreadable — the
+   *property*. A build that erased the files but derived the root from long-term keys
+   would have passed everything. `tests/test_messaging_forward_secrecy.py` now mounts
+   the derivation with forged inputs and compares roots.
+2. **Goal 11's tamper tests asserted only `delivered == []`.** A receiver that silently
+   dropped a forged message and one that reported `signature_invalid` with a message id
+   were indistinguishable. The brief asks for the second.
+3. **Goal 12 never tested the attack the brief names.** Wrong-key and wrong-peer cases
+   were covered; a thief holding *both* the ticket and the session id was not.
+
+### Two mistakes this phase caught in its own tooling
+
+Both are recorded because they were the kind that produce a false PASS:
+
+* A **shallow** `dict(f)` copy meant "forging" a fragment also rewrote the genuine one,
+  so a correct detector appeared to lose messages. Fixed with `deepcopy`.
+* The goal-9 check accepted **any** failure reason. With recipient binding deleted
+  outright, the message still failed — as `signature_invalid` — and the gate still
+  reported 17/17. It now requires the specific reason, and deleting the check drops it
+  to 15/17. A gate that accepts any failure measures nothing.
+
 ## 2. Clean-machine setup (tested)
 
 Tested on Linux x86_64 with CPython 3.11 and 3.12; the judging runtime is

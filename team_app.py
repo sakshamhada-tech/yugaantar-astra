@@ -43,7 +43,8 @@ SUPPORTED_OPS = {"setup", "read", "revoke", "audit", "protected_read"}
 # Phase 3: key lifecycle and log integrity. Additions, like the messaging ops: the
 # contract explicitly says the twelve goals include capabilities outside its
 # protected-resource interface.
-KEY_OPS = {"rotate", "key_status", "log_verify", "log_head"}
+KEY_OPS = {"rotate", "key_status", "log_verify", "log_head",
+           "cluster_publish", "cluster_sync", "cluster_status"}
 # Phase 2: messaging operations are additions to, not replacements for, the five
 # contract operations. The adapter contract says the twelve goals include
 # capabilities outside its protected-resource interface, and explicitly notes that
@@ -202,6 +203,47 @@ def _dispatch_keys(request: dict) -> dict:
         if op == "log_verify":
             ok, records = store.verify_audit_chain()
             return {"ok": ok, "records": records}
+        if op == "cluster_publish":
+            kind = request.get("kind")
+            if kind not in ("revoke", "rotate", "enrol"):
+                return {"error": "malformed_request"}
+            payload = request.get("payload")
+            if not isinstance(payload, dict):
+                return {"error": "malformed_request"}
+            notice = store.publish_notice(kind, payload)
+            return {"published": True, "kind": notice["kind"], "seq": notice["seq"],
+                    "notice": notice}
+        if op == "cluster_sync":
+            # Pull every notice currently in the shared outbox and apply the valid
+            # ones. The outbox is a directory of *signed* blobs; trust comes from the
+            # signature and the publisher key the caller pins, not from the location.
+            publisher = request.get("publisher_public")
+            if not isinstance(publisher, str):
+                return {"error": "malformed_request"}
+            import base64 as _b64
+
+            try:
+                publisher_bytes = _b64.b64decode(publisher.encode("ascii"), validate=True)
+            except Exception:
+                return {"error": "malformed_request"}
+            outbox = store.cluster_outbox()
+            notices = []
+            if outbox.exists():
+                import json as _json
+
+                for path in sorted(outbox.glob("*.json")):
+                    try:
+                        notices.append(_json.loads(path.read_text(encoding="utf-8"))["notice"])
+                    except Exception:
+                        continue
+            return store.apply_notices(notices, publisher_bytes)
+        if op == "cluster_status":
+            state = store._read_state()
+            return {
+                "active_version": state.get("active_version", 1),
+                "remote_key_version": state.get("remote_key_version", 0),
+                "disabled": sorted(state.get("disabled", [])),
+            }
         if op == "log_head":
             # Deliberately just the head digest: an operator stores this elsewhere
             # and later proves the file has not been rewritten or truncated.

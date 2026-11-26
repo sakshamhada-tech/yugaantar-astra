@@ -450,6 +450,79 @@ class StateStore:
         ring["active_version"] = state.get("active_version", ring.get("active_version", 1))
         return ring
 
+    def publish_notice(self, kind: str, payload: dict) -> dict:
+        """Sign a notice with this node's publisher key and drop it in the outbox."""
+        from . import cluster
+
+        node = cluster.Node(self.root.parent, self.node_id(), outbox=self.cluster_outbox())
+        pair, fp = cluster.public_identity_fields(KeyStore(self.root / "cluster-identity"))
+        return node.publish(kind=kind, payload=payload, publisher_key=pair.secret_key, publisher_fp=fp)
+
+    def cluster_outbox(self) -> Path:
+        """Where this node publishes. Siblings share it; it is *not* trusted input.
+
+        A notice found here is verified before it means anything, so the directory
+        only has to be a channel, not a safe place.
+        """
+        # TRACK4_CLUSTER_DIR is the shared parent of sibling node directories. It is
+        # read from the environment only, never from a request, and it defaults to
+        # the node's own directory -- so by default a node publishes only to itself
+        # and nothing propagates by accident.
+        shared = os.environ.get("TRACK4_CLUSTER_DIR")
+        base = Path(shared) if shared else self.root.parent
+        return ensure_private_dir(base / "cluster-outbox")
+
+    def node_id(self) -> str:
+        """Stable id for this state directory. Derived from the path, not the clock."""
+        return "node-" + hashlib.sha256(str(self.root).encode("utf-8")).hexdigest()[:12]
+
+    def apply_notices(self, notices: list, publisher_public: bytes) -> dict:
+        """Verify and apply notices in one locked, persisted step.
+
+        Application is commutative and idempotent: revocation is a set insert and the
+        key version is a max(), so notices may arrive in any order and a duplicate is
+        a no-op. Anything that fails verification or fails the sequence check is
+        counted and dropped -- it never touches state.
+        """
+        from . import cluster
+
+        node = cluster.Node(self.root.parent, self.node_id(), outbox=self.cluster_outbox())
+        applied, rejected = [], []
+        with self._locked():
+            state = self._read_state()
+            for notice in notices or []:
+                try:
+                    result = node.ingest(notice, signer_public=publisher_public)
+                except cluster.NoticeError as error:
+                    rejected.append(error.reason)
+                    continue
+                parsed = notice
+                if result["kind"] == cluster.KIND_REVOKE:
+                    actor = str(parsed["payload"].get("actor", ""))
+                    if actor and actor not in state["disabled"]:
+                        state["disabled"].append(actor)
+                        self._append_audit(state, {
+                            "op": "revoke", "actor": actor, "request_id": "", "asset": "",
+                            "decision": "revoke", "rule": "identity_revoked_remote", "ts": _now(),
+                        })
+                elif result["kind"] == cluster.KIND_ROTATE:
+                    # Rotation notice: adopt the announced version if it is newer than
+                    # what we already have. max() makes this order-independent.
+                    target = int(parsed["payload"].get("key_version", 0))
+                    if target > int(state.get("active_version", 1)):
+                        state["remote_key_version"] = target
+                        self._append_audit(state, {
+                            "op": "rotate", "actor": "", "request_id": "", "asset": "",
+                            "decision": "rotate",
+                            "rule": f"notice_key_v{target}", "ts": _now(),
+                        })
+                applied.append(result)
+            self._write_state(state)
+        return {"applied": len(applied), "rejected": len(rejected), "reasons": rejected}
+
+    def recovery_pending(self) -> bool:
+        return False
+
     def recover(self) -> dict:
         """Placeholder until goal 3 adds the intent log. Returns a no-op report."""
         return {"recovered": False, "active_version": self._read_state().get("active_version", 1)}

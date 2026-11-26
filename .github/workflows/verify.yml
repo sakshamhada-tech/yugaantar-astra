@@ -40,7 +40,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install --only-binary=:all: -r requirements.lock -r requirements-dev.lock
       - name: Test
-        run: "PYTHONPATH=src:. python -m pytest tests -q"
+        # print the failing test names as workflow annotations, because the raw job log
+        # is not always retrievable
+        run: |
+          set -o pipefail
+          PYTHONPATH=src:. python -m pytest tests -q --tb=short 2>&1 | tee /tmp/pytest.log
+      - name: Report failures as annotations
+        if: failure()
+        run: |
+          grep -E "^(FAILED|ERROR)" /tmp/pytest.log | head -40 | while IFS= read -r line; do
+            echo "::error title=pytest::${line:0:800}"
+          done
+          echo "--- last 60 lines of the run ---"
+          tail -60 /tmp/pytest.log | while IFS= read -r line; do
+            echo "::error title=tail::${line:0:800}"
+          done
       - name: Lost-device walkthrough (checks no plaintext at rest)
         run: "python scripts/demo_lost_device.py"
       - name: Phase 2 messaging acceptance (goals 9-12, real subprocesses)

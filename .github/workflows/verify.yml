@@ -117,10 +117,16 @@ jobs:
           printf '%s' '{"op":"read","actor":"maya","asset":"brief","request_id":"r1"}' \
             | docker run --rm -i --read-only --tmpfs /tmp pqc-kv:phase1
       - name: Organizer validator against the image
+        # The validator writes __pycache__ next to the toolkit, so the toolkit mount
+        # cannot be read-only: that made `docker run` exit 125 before the validator
+        # ever started, which reads as a failing validator when it is a container
+        # error. The toolkit is a throwaway clone inside the workspace, so letting the
+        # container write to it costs nothing.
         run: |
           git clone --depth 1 https://github.com/ScalerOpenSourceLabs/Track-4-Toolkit.git toolkitchk
+          ls -l toolkitchk/validate.py
           docker run --rm \
-            -v "$PWD/toolkitchk:/toolkit:ro" \
+            -v "$PWD/toolkitchk:/toolkit" \
             -v "$PWD/track4_service.py:/toolkit/track4_service.py:ro" \
             -v "$PWD/team_app.py:/toolkit/team_app.py:ro" \
             -v "$PWD/src:/toolkit/src:ro" \

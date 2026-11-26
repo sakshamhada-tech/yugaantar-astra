@@ -84,6 +84,27 @@ One command does all three (toolkit path optional):
 ./scripts/verify_install.sh /path/to/Track-4-Toolkit
 ```
 
+### Is Phase 1 actually done? Run the acceptance gate
+
+```sh
+python scripts/phase1_acceptance.py --toolkit /path/to/Track-4-Toolkit
+```
+
+It runs — not describes — 13 checks and prints PASS/FAIL/SKIP per line, exiting
+non-zero if anything fails. Skips are listed separately so they are never read as
+green. Last full run in this repo: **12 passed, 0 failed, 1 skipped** (the skip is
+"interpreter is 3.12", because the sandbox here is 3.11).
+
+The individual checks, if you prefer to run them by hand:
+
+```sh
+PYTHONPATH=src:. python -m pytest tests -q                    # 139 passed, 1 skipped
+cd /path/to/Track-4-Toolkit && python validate.py --entry /path/to/yugaantar-astra/track4_service.py
+                                                              # 22 PASS, 0 FAIL
+python scripts/demo_lost_device.py                            # plaintext at rest: none
+./scripts/verify_container_contract.sh /path/to/Track-4-Toolkit  # read-only rootfs
+```
+
 ### Docker (Python 3.12, linux/amd64)
 
 ```sh

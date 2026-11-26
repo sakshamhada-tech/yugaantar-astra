@@ -14,7 +14,7 @@ be answerable independently of the device asking — and still answerable once q
 computers break today's primitives. This project seals every protected body under
 ML-KEM-768, AES-256-GCM and ML-DSA-65, hash-chains every decision into an audit log, and
 applies a revocation on the **next** request rather than the next day. What distinguishes it
-is the proof rather than the feature list: 36 attacks against our own shipped adapter, 819
+is the proof rather than the feature list: 38 attacks against our own shipped adapter, 823
 tests, and a demonstration that shows failures being refused instead of described as
 refused.
 
@@ -52,7 +52,7 @@ with no restart; the ML-KEM panel shows ciphertext and proof and asserts the pla
 absent; a message is delivered, then re-addressed to carol (`wrong_recipient`), then
 replayed (`duplicate_fragments=4`, 0 delivered); detection names one unapproved privilege
 change and one lateral chain; the signed log verifies clean, loses its last record, and
-fails with `head_mismatch`; the 36-attack gate runs. It closes on the rollback risk, stated
+fails with `head_mismatch`; the 38-attack gate runs. It closes on the rollback risk, stated
 on camera rather than left to be found.
 
 **Observed outcome:** every panel drives the real adapter in a fresh process, so the video

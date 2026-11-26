@@ -89,6 +89,36 @@ class StateStore:
         self._sealed_material_path = self.root / "synthetic-material.env"
 
     # ------------------------------------------------------------ locking/io
+    # Temp files left behind when a process is killed between `mkstemp` and `replace`.
+    # The `finally` in `_write_state` cannot run under SIGKILL, so leftovers are not a
+    # bug to be prevented -- they are a fact to be reclaimed.
+    ORPHAN_PREFIXES = (".state-", ".tmp-key-", ".tmp-")
+
+    def _sweep_orphans(self) -> int:
+        """Remove temp files orphaned by a previous crash. Caller must hold the lock.
+
+        Only safe while the lock is held: with the single-writer lock taken, any
+        matching file is stale by definition, because the live writer is us.
+        Leftovers are a small availability problem (a state directory that slowly
+        fills with junk) and a worse readability one -- an operator cannot tell a
+        crashed write from an attacked one.
+        """
+        removed = 0
+        try:
+            entries = list(self.root.iterdir())
+        except OSError:
+            return 0
+        for entry in entries:
+            if not entry.name.startswith(self.ORPHAN_PREFIXES):
+                continue
+            try:
+                if entry.is_file() or entry.is_symlink():
+                    entry.unlink()
+                    removed += 1
+            except OSError:
+                pass
+        return removed
+
     @contextmanager
     def _locked(self):
         """Single-writer lock so two concurrent requests cannot interleave state."""
@@ -96,6 +126,8 @@ class StateStore:
         try:
             os.chmod(self.lock_path, 0o600)
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            # After a crash this is the first moment it is provably safe to clear up.
+            self._sweep_orphans()
             yield
         finally:
             try:
@@ -413,8 +445,12 @@ class StateStore:
                 state["disabled"].append(actor)
                 # Monotonic counter; the rollback check for backups compares it.
                 state["revocation_seq"] = int(state.get("revocation_seq", 0)) + 1
-                self._write_state(state)
+                # The event is recorded BEFORE the state write, because recording it
+                # stamps `events_head`/`events_count` into `state` -- and this write is
+                # what persists that stamp. Recording afterwards leaves the anchor one
+                # event stale, which makes a genuine log fail verification.
                 self.record_event("revoke", actor if _safe_actor(actor) else "", state=state)
+                self._write_state(state)
                 self._append_audit(state, {
                     "op": "revoke",
                     "actor": actor,
@@ -497,9 +533,12 @@ class StateStore:
             })
             intent.fault_point("after_commit")
             intent.clear(self.root)
-            # Goal 5: every rotation is a key event. Written after the commit so a
-            # crash cannot leave an event for a rotation that did not happen.
+            # Goal 5: every rotation is a key event. The commit marker above is what
+            # guarantees a crash cannot leave an event for a rotation that did not
+            # happen, so the event may be recorded and then persisted with the stamp
+            # it writes into `state`.
             self.record_event("rotate", "", f"v{before}-to-v{new_entry.version}", state=state)
+            self._write_state(state)
         return {
             "active_version": new_entry.version,
             "retiring_version": old_entry.version,
@@ -633,8 +672,8 @@ class StateStore:
                 "decision": "restore", "rule": f"keys_v{int(state.get('active_version', 1))}",
                 "ts": _now(),
             })
-            self._write_state(state)
             self.record_event("restore", "", f"keys-{len(payload)}", state=state)
+            self._write_state(state)
         return {"restored": sorted(payload), "count": len(payload)}
 
     def recovery_pending(self) -> bool:
@@ -712,6 +751,7 @@ class StateStore:
             })
             intent.clear(self.root)
             self.record_event("recover", "", f"to-v{entry.version}", state=state)
+            self._write_state(state)
         return {
             "recovered": True,
             "action": "completed",

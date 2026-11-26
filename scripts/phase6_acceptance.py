@@ -80,7 +80,7 @@ def gate_the_red_team() -> None:
     # deleting a whole family does. Without this, a suite that runs nothing would
     # report the same "no BROKEN lines" as a suite where everything held.
     families = {"authz": 3, "concurrency": 2, "rollback": 1, "parser": 3,
-                "log": 4, "atomicity": 1, "messaging": 4, "crypto": 4,
+                "log": 4, "atomicity": 3, "messaging": 4, "crypto": 4,
                 "disk": 4, "hostile": 2, "resources": 2}
     present = {name: len(re.findall(rf"^HELD \[{name}/", out, re.M))
                for name in families}
@@ -90,7 +90,7 @@ def gate_the_red_team() -> None:
           f"{len(families)} families present: " + ", ".join(
               f"{name} {present[name]}" for name in sorted(families))
           if not missing else f"families below their floor: {missing}")
-    check("redteam/suite-is-substantial", held >= 30,
+    check("redteam/suite-is-substantial", held >= 35,
           f"{held} attacks held")
 
 

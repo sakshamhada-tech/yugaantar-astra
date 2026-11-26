@@ -240,7 +240,7 @@ footer { color:var(--dim); font-size:11.5px; padding:0 26px 40px; }
   <div class="goal">our own attacks</div>
   <div class="desc">Runs <code class="mono">scripts/redteam.py</code> and shows every
   attack we tried and whether it held.</div>
-  <div class="row"><button onclick="run('redteam','all')">run 36 attacks</button></div>
+  <div class="row"><button onclick="run('redteam','all')">run 38 attacks</button></div>
   <div id="redteam-out"><div class="cmd">no request yet</div></div>
 </section>
 

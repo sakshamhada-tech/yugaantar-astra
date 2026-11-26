@@ -24,6 +24,7 @@ Three rules, because a red-team script that overstates itself is worse than none
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -216,6 +217,19 @@ def attack_crypto(tmp: Path) -> None:
 
 
 # ---------------------------------------------------------------- disk / integrity
+def asset_file(state: Path, asset: str) -> Path:
+    """The envelope path for a named asset, computed rather than discovered.
+
+    `store.py` names it ``asset-<sha256(asset)[:16]>.env``. Do not walk the directory
+    and take the first hit: iteration order is not asset order, so that corrupts a
+    file at random and then asserts about a different asset. The same mistake made a
+    test in `tests/test_adapter_hardening.py` fail on the CI runner and pass locally,
+    which is the worst way for a test to be wrong.
+    """
+    digest = hashlib.sha256(asset.encode("utf-8")).hexdigest()[:16]
+    return state / STATE / "assets" / f"asset-{digest}.env"
+
+
 def attack_disk(tmp: Path) -> None:
     corruptions = [
         ("asset file deleted", lambda p: p.unlink()),
@@ -225,21 +239,36 @@ def attack_disk(tmp: Path) -> None:
     ]
     crashes, leaks = [], []
     for index, (label, mutate) in enumerate(corruptions):
-        state = fresh(tmp, f"disk{index}")
-        mutate(next(iter((state / STATE / "assets").glob("*.env"))))
-        code, body = call(state, op="read", actor="maya", asset="brief",
-                          request_id=f"d{index}")
-        if code != 0:
-            crashes.append(label)
-        elif body and body.get("body"):
-            leaks.append(label)
+        for asset, owner in (("brief", "maya"), ("notes", "ravi")):
+            state = fresh(tmp, f"disk{index}-{asset}")
+            target = asset_file(state, asset)
+            if not target.exists():
+                crashes.append(f"{label}: no envelope for {asset}")
+                continue
+            mutate(target)
+            code, body = call(state, op="read", actor=owner, asset=asset,
+                              request_id=f"d{index}-{asset}")
+            if code != 0:
+                crashes.append(f"{label}/{asset}")
+            elif body and body.get("body"):
+                leaks.append(f"{label}/{asset}")
+            # the neighbouring asset must still be readable: one damaged envelope
+            # must not take the store down
+            other_asset, other_owner = (("notes", "ravi") if asset == "brief"
+                                        else ("brief", "maya"))
+            code, body = call(state, op="read", actor=other_owner,
+                              asset=other_asset, request_id=f"n{index}-{asset}")
+            if code != 0 or not body or body.get("decision") != "allow":
+                crashes.append(f"neighbour-unreadable after {label}/{asset}")
     check("disk/corrupt-asset-denies-not-crashes", not crashes and not leaks,
-          f"{len(corruptions)} corruptions -> all deny, no crash, no plaintext"
+          f"{len(corruptions)} corruptions x 2 assets -> all deny, no crash, "
+          f"neighbour still readable"
           if not crashes and not leaks else f"crashes={crashes} leaks={leaks}")
 
     # Ciphertext bit-flip and cross-asset envelope swap.
     state = fresh(tmp, "diskflip")
-    asset = next(iter((state / STATE / "assets").glob("*.env")))
+    asset = asset_file(state, "brief")
+    assert asset.exists(), "expected the envelope for 'brief'"
     outer = json.loads(asset.read_text())
     inner = json.loads(outer["envelope"])
     ciphertext = inner["ct"]
@@ -596,16 +625,41 @@ def attack_log_integrity(tmp: Path) -> None:
 
 
 # ------------------------------------------------------------- crash atomicity
+def _orphan_prefixes() -> tuple:
+    """The temp-file prefixes the store reclaims, read from the store itself."""
+    sys.path.insert(0, str(ROOT / "src"))
+    from pqc_kv.store import StateStore
+
+    return StateStore.ORPHAN_PREFIXES
+
+
+ORPHAN_PREFIXES = _orphan_prefixes()
+
+
 def attack_crash_atomicity(tmp: Path) -> None:
-    """SIGKILL a mutating request at random points; state must stay usable."""
+    """SIGKILL a mutating request at random points; state must stay usable.
+
+    Nothing here asserts "no temp files are left". A kill between `mkstemp` and
+    `replace` leaves one, and the `finally` that would unlink it cannot run -- so that
+    assertion would be asserting something false, and it made this check flaky (1, 2
+    or 0 orphans depending on where the signal landed). What is asserted instead:
+    the state stays usable, and the next request reclaims whatever was orphaned.
+    """
     import signal
     import time
 
     state = fresh(tmp, "atomic")
     env = {k: v for k, v in os.environ.items() if not k.startswith("TRACK4")}
     env["TRACK4_STATE_DIR"] = str(state)
+    internal = state / STATE
+
+    def orphans() -> list:
+        return [p.name for p in internal.iterdir()
+                if p.name.startswith(ORPHAN_PREFIXES)]
+
     broken = 0
     trials = 12
+    peak_orphans = 0
     for index in range(trials):
         process = subprocess.Popen(
             [sys.executable, "-B", str(ADAPTER)], cwd=str(ROOT), env=env,
@@ -616,15 +670,41 @@ def attack_crash_atomicity(tmp: Path) -> None:
         time.sleep(0.05 + (index % 6) * 0.005)
         process.send_signal(signal.SIGKILL)
         process.wait()
+
+        # Measured BEFORE any further request, because that request takes the lock
+        # and sweeps -- after it, the count is always zero and says nothing.
+        peak_orphans = max(peak_orphans, len(orphans()))
+
         code, body = call(state, op="read", actor="maya", asset="brief",
                           request_id=f"k{index}")
         if code != 0 or (body or {}).get("error") == "request_failed":
             broken += 1
-    leftovers = [p.name for p in (state / STATE).iterdir() if p.name.startswith(".state-")]
-    check("atomicity/sigkill-leaves-usable-state",
-          broken == 0 and not leftovers,
-          f"{trials} SIGKILLs during a write -> {broken} left unusable state, "
-          f"{len(leftovers)} temp files left behind")
+
+    check("atomicity/sigkill-leaves-usable-state", broken == 0,
+          f"{trials} SIGKILLs at random points in a mutating request -> {broken} left "
+          f"the state unusable (up to {peak_orphans} temp file(s) orphaned at a time, "
+          f"which is expected: a finally block cannot run under SIGKILL)")
+
+    # Reclamation, tested deterministically rather than hoping a signal lands in the
+    # right microsecond: plant orphans and require the next request to clear them.
+    planted = []
+    for prefix in ORPHAN_PREFIXES:
+        victim = internal / f"{prefix}planted-by-the-gate"
+        victim.write_text("junk")
+        planted.append(victim)
+    before = len(orphans())
+    call(state, op="read", actor="maya", asset="brief", request_id="reclaim")
+    after = orphans()
+    check("atomicity/orphans-reclaimed-not-accumulated",
+          before == len(ORPHAN_PREFIXES) and not after,
+          f"{before} planted orphan(s) -> {len(after)} after one request took the lock")
+
+    # And the rollback mechanism still works after all that killing: the state the
+    # process acknowledged is the state on disk.
+    code, body = call(state, op="read", actor="maya", asset="brief",
+                      request_id="post-crash")
+    check("atomicity/acknowledged-state-survives", code == 0 and body is not None,
+          "a read after 12 kills and a reclaim still answers with JSON")
 
 
 if __name__ == "__main__":

@@ -159,3 +159,74 @@ def test_the_state_head_follows_every_event(state):
         (state / "pqc-kv-state" / "state.json").read_text()
     )["events_head"]
     assert recorded == after["events_head"]
+
+
+# ------------------------------------------------- does the anchor track *every* op?
+# The anchor is only as good as its freshness. A stamp that is written by the event but
+# not persisted by the operation leaves the anchor one event behind -- and then a
+# completely genuine log fails verification with `head_mismatch`. That is a false
+# positive in a security check, which is its own kind of failure: an operator who learns
+# to ignore `head_mismatch` has lost the detection entirely.
+#
+# It happened: `record_event(..., state=state)` stamped the head into the dict, but
+# `rotate` and `recover` called it *after* their final `_write_state`, so the stamp was
+# never persisted. Only `revoke` got the ordering right. This test drives each mutating
+# operation and requires the anchor to still match afterwards, so any future operation
+# that forgets to persist the stamp is caught by the operation that forgot.
+def _store(state: Path):
+    sys.path.insert(0, str(ROOT / "src"))
+    from pqc_kv.store import StateStore
+
+    return StateStore(state)
+
+
+def _revoke(state: Path) -> dict:
+    return _store(state).revoke("dave")
+
+
+def _rotate(state: Path) -> dict:
+    return _store(state).rotate({"grace": 2})
+
+
+def _restore(state: Path) -> dict:
+    store = _store(state)
+    secret = b"backup-key-for-the-test-only"
+    blob = store.create_backup(secret)
+    from pqc_kv.dsa import generate_keypair  # noqa: F401  (signer is internal)
+
+    return store.restore_backup(blob, secret, store.ring.dsa_pair(
+        int(store._read_state()["active_version"])).public_key)
+
+
+def _recover(state: Path) -> dict:
+    return _store(state).recover()
+
+
+MUTATORS = [("revoke", _revoke), ("rotate", _rotate),
+            ("restore", _restore), ("recover", _recover)]
+
+
+@pytest.mark.parametrize("label,mutate", MUTATORS, ids=[m[0] for m in MUTATORS])
+def test_the_anchor_matches_after_every_mutating_operation(state, label, mutate):
+    mutate(state)
+
+    store = _store(state)
+    head, count = store._event_log().head()
+    remembered = store.remembered_events_head()
+    remembered_count = store._read_state().get("events_count")
+
+    assert remembered, f"`{label}` left no anchor at all"
+    assert remembered == head, (
+        f"after `{label}` the persisted anchor is stale: state records "
+        f"{remembered[:12]} but the log ends at {head[:12]}. A genuine log would now "
+        f"fail verification with head_mismatch."
+    )
+    assert remembered_count == count, (
+        f"after `{label}` the persisted count is {remembered_count} but the log has "
+        f"{count}"
+    )
+
+    # And the operator-facing check agrees.
+    verified = store.verify_events()
+    assert verified["ok"] is True, verified
+    assert verified["reason"] is None

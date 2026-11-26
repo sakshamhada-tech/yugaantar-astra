@@ -1208,7 +1208,7 @@ The instructor will attempt to break this system. This section is the record of 
 it first. Every attack below was **run against the shipped adapter** (`redteam.py`,
 23 checks), and the three that succeeded are now fixed and pinned by tests.
 
-    python scripts/redteam.py      # 23/23 attacks held
+    python scripts/redteam.py      # 38/38 attacks held
 
 ## P6-1. Findings, in order of severity
 
@@ -1333,8 +1333,8 @@ The first 23 attacks went after authorization and the wire format. That left who
 classes untouched: what happens when two requests arrive at once, when the process is
 killed mid-write, when the attacker can restore yesterday's directory, when the parser
 disagrees with itself, and when the log is *shortened* rather than edited. Each of those
-was attacked directly. Thirteen checks were added to `scripts/redteam.py`, which now runs
-36 and exits non-zero if any of them stops holding.
+was attacked directly. Fifteen checks were added to `scripts/redteam.py`, which now runs
+38 and exits non-zero if any of them stops holding.
 
 ## P6-5. The finding that mattered: a shortened log verified as intact
 
@@ -1439,3 +1439,96 @@ exists because a reviewer who can click a button and watch a revocation take eff
 more than one who reads "revocation: verified". It is read-only, stdlib-only, has no
 hosted assets, and runs against throwaway state directories under a temp path that are
 deleted on exit — so it cannot be the reason a demo fails in an offline container.
+
+## P6-9. Two defects in the *gates*, found only by running them on someone else's machine
+
+Both were mine, and both are the kind that make a green build meaningless.
+
+**The test that corrupted one file and asserted about another.** CI reported four
+failures in `test_a_damaged_asset_file_denies_instead_of_crashing`, with
+`{'decision': 'allow', 'body': 'MAYA-SECRET'}` where a deny was expected. The product was
+correct. The test did this:
+
+```python
+mutate(next(iter((internal / "assets").glob("*.env"))))   # whichever file comes first
+code, body, _ = call(state, op="read", actor="maya", asset="brief", ...)
+assert body == {"decision": "deny"}
+```
+
+`glob` returns directory iteration order, which is not asset order. The setup fixture
+creates `brief` (owned by maya) and `notes` (owned by ravi). On the CI runner the first
+entry was **`notes`**, so the test damaged ravi's file, then read maya's — which was
+intact, and correctly allowed. It passed locally for the accidental reason that this
+filesystem returned `brief` first.
+
+The fix computes the path instead of discovering it, because the name is a pure function
+of the asset id: `asset-<sha256(asset)[:16]>.env`. The test now names the file it means,
+asserts the mutation hit it, and additionally asserts the *neighbouring* asset is still
+readable — one corrupt envelope must not take the store down. Verified order-independent
+by re-running with `Path.glob` monkeypatched to reverse its output, and verified still
+non-vacuous by removing both layers of the F1 defence and watching all four cases fail.
+
+The same latent bug existed in `attack_disk` in `scripts/redteam.py`, where it was worse
+than a test defect: as an *attack*, corrupting a random asset meant the cross-asset
+independence property was never actually tested. It now corrupts each asset in turn
+(both directions) and asserts the neighbour still opens.
+
+**The security check that failed at random.** `atomicity/sigkill-leaves-usable-state`
+asserted `not leftovers` after 12 `SIGKILL`s. It went from HELD to BROKEN between runs
+because a kill landing between `mkstemp` and `replace` leaves a `.state-*` file, and the
+`finally` that would unlink it **cannot run under SIGKILL**. The assertion was not strict;
+it was false, and whether it passed depended on where the signal landed.
+
+Worse, it was hiding a real observation. Two separate properties were being tested as one:
+
+1. *The state is never unusable after a kill.* True, and now asserted alone.
+2. *Orphaned temp files do not accumulate.* This was never true, and nothing reclaimed
+   them. Left alone, a crash-looping service slowly fills its state directory with junk,
+   and an operator cannot distinguish a crashed write from an attacked one.
+
+So the product gained a fix and the check was split in three. `StateStore._sweep_orphans()`
+now runs as the first action inside the single-writer lock — the first moment it is
+provably safe, because the live writer is us — and removes files matching
+`.state-`, `.tmp-key-`, `.tmp-`. The reclamation check no longer waits for a signal to
+land in the right microsecond: it plants one orphan per prefix and requires the next
+request to clear them, and a separate check measures the orphan count *before* any
+following request, since taking the lock would otherwise zero it and prove nothing.
+
+Three consecutive runs: 38/38, stable. The honest summary of the original state is that
+the second pass had a false-confidence defect — it reported a passing check for an
+invariant that was false half the time.
+
+### P6-9b. The third defect: a fix applied to one call site out of four
+
+Fixing the truncation finding meant stamping the log anchor into `state.json`. That stamp
+is written by `record_event(..., state=state)`, which mutates the caller's state dict — so
+the caller must persist that dict **afterwards** for the stamp to exist at all.
+
+`revoke` recorded the event and then wrote the state. `rotate`, `recover` and `restore`
+wrote the state and then recorded the event. The stamp went into a dict that nobody
+persisted, so `state.json` kept the anchor from the *previous* event.
+
+The symptom is the opposite of the original bug, and arguably worse: a completely genuine
+log failed verification with `head_mismatch`, `actual_head` equal to a correct chain head,
+and `first_bad` past the end of the file. Phase 3's `goal5/signed-chain` caught it — a
+check that had been passing for weeks — because it verifies the chain *after* a rotate.
+The truncation tests did not, because their fixture only revokes.
+
+Detection that cries wolf is worse than detection that stays quiet: an operator who sees
+`head_mismatch` on an untouched log learns to ignore the one signal that catches
+truncation. So the anchor's freshness is now a tested property, not an implementation
+detail: `test_the_anchor_matches_after_every_mutating_operation` runs each of the four
+mutating operations (revoke, rotate, restore, recover) and requires the persisted anchor
+and count to match the log exactly, then requires `verify_events()` to agree. Because it
+is parametrised over the operations, an operation added later without persisting its stamp
+fails at the operation that forgot, not somewhere unrelated.
+
+Verified by re-breaking `rotate` on purpose and watching exactly that one case fail.
+
+**The lesson this whole episode teaches, and it is the same one three times over:** the
+first-pass work was checked by tests I chose, and I chose tests that confirmed what I
+believed. Every one of these three defects was found by a gate that already existed and
+that I had not thought to re-run — the CI suite on another machine, Phase 3's chain check,
+and my own red-team gate run twice in a row. The fix for that is not more tests; it is
+running the ones that exist, in an environment that is not the one you developed in, more
+than once.

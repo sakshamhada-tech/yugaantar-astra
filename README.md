@@ -310,7 +310,7 @@ The live security assessment attacks this system. Rather than wait for that, the
 attacks are written down and run as a gate:
 
 ```sh
-python scripts/redteam.py           # 36/36 attacks held
+python scripts/redteam.py           # 38/38 attacks held
 python scripts/phase6_acceptance.py # 12/12, incl. proving the fix by removing it
 ```
 
@@ -382,6 +382,7 @@ check every time, so the test cannot quietly stop testing anything.
 | `NaN`, `Infinity`, typed `request_id` | refused without a crash |
 | symlink planted at a rotate target | rotate refused; nothing written outside the directory |
 | **truncate or empty the signed log** | **was `ok: true` → now `head_mismatch`** |
+| orphaned temp files after `SIGKILL` | were never reclaimed; now swept on the next lock |
 | reorder / edit / duplicate / forge a record | `chain_broken` |
 
 **Still undefeated, and stated as such: rollback of the state directory.** Restoring a
@@ -409,7 +410,7 @@ Six panels: access decisions (including a revocation taking effect on the next r
 the ML-KEM protected read (ciphertext and HMAC proof, with the plaintext provably absent),
 end-to-end messaging (deliver, re-address to the wrong recipient, replay every fragment),
 detection over a sample log, signed-log verification in healthy and truncated states, and
-the 36-attack red-team gate.
+the 38-attack red-team gate.
 
 **No UI is required by the brief** — the submission is a two-page PDF plus a five-minute
 video, and no interface is scored. The dashboard exists because a reviewer who clicks a

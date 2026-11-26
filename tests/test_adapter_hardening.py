@@ -18,6 +18,7 @@ The second finding is unrelated and equally simple: a file opened for append def
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -75,6 +76,24 @@ def internal(tmp_path):
     return tmp_path / "pqc-kv-state"
 
 
+def asset_file(internal: Path, asset: str) -> Path:
+    """The envelope file for a named asset, computed rather than discovered.
+
+    `store.py` names it ``asset-<sha256(asset)[:16]>.env``, so the name is a pure
+    function of the asset id.
+
+    This helper exists because the first version of the test below used
+    ``next(iter((internal / "assets").glob("*.env")))`` and mutated whichever file
+    came back first. That is directory iteration order, which is not the asset order:
+    on the CI runner the first entry was `notes`, so the test corrupted the wrong
+    file, read `brief` successfully, and failed with `{'decision': 'allow'}`. The
+    product was right; the test was picking a file at random and asserting about a
+    different one.
+    """
+    digest = hashlib.sha256(asset.encode("utf-8")).hexdigest()[:16]
+    return internal / "assets" / f"asset-{digest}.env"
+
+
 # --------------------------------------------------------------------- crashes
 # Each of these produced `exit 1` with empty stdout before the fix. A crash is worse
 # than a deny: the judge sees no JSON at all, and any wrapper that assumes a reply
@@ -95,11 +114,20 @@ def test_a_damaged_asset_file_denies_instead_of_crashing(state, internal, label,
     caught `StoreError`. The exception escaped to `track4_service.py`, which correctly
     refused to print details -- and so printed nothing at all, exiting 1.
     """
-    mutate(next(iter((internal / "assets").glob("*.env"))))
+    target = asset_file(internal, "brief")
+    assert target.exists(), f"expected the envelope for 'brief' at {target.name}"
+    mutate(target)
     code, body, _ = call(state, op="read", actor="maya", asset="brief",
                          request_id=f"c-{label}")
     assert code == 0, "the adapter must always answer with JSON"
     assert body == {"decision": "deny"}, body
+
+    # And the other asset is untouched by its neighbour's damage: a corrupt envelope
+    # must not take the whole store down. Without this the test could pass by
+    # breaking everything, which is a different (and wrong) behaviour.
+    other = call(state, op="read", actor="ravi", asset="notes", request_id=f"o-{label}")
+    assert other[0] == 0, "a damaged neighbour must not crash the next request"
+    assert other[1] == {"decision": "allow", "body": "RAVI-SECRET"}, other[1]
 
 
 def test_a_corrupt_keyring_refuses_the_read_instead_of_crashing(state, internal):
@@ -200,3 +228,34 @@ def test_a_huge_detection_log_is_capped_not_processed_forever(state):
     # The line was refused rather than parsed as an event.
     assert body["ingest"]["events_accepted"] == 0
     assert elapsed < 5.0, f"took {elapsed:.1f}s of an 8s budget"
+
+
+# --------------------------------------------------------- orphaned temp files
+# A SIGKILL between `mkstemp` and `replace` leaves a `.state-*` file behind; the
+# `finally` that would unlink it cannot run. That is a fact about signals, not a bug,
+# so the property to test is reclamation: the next request holding the lock clears it.
+#
+# This test plants the orphans rather than trying to land a signal in the right
+# microsecond. The first version of the attack in `scripts/redteam.py` asserted "no
+# leftovers" and was therefore flaky -- it passed or failed depending on where the
+# kill landed. A security check that fails at random is worse than no check.
+@pytest.mark.parametrize("prefix", (".state-", ".tmp-key-", ".tmp-"))
+def test_an_orphaned_temp_file_is_reclaimed_by_the_next_request(state, internal, prefix):
+    orphan = internal / f"{prefix}left-by-a-crashed-write"
+    orphan.write_text("half-written junk")
+    assert orphan.exists()
+
+    code, body, _ = call(state, op="read", actor="maya", asset="brief",
+                         request_id=f"sweep-{prefix}")
+    assert code == 0, "a leftover temp file must not stop the next request"
+    assert body == {"decision": "allow", "body": "MAYA-SECRET"}, body
+    assert not orphan.exists(), "the orphan should have been reclaimed under the lock"
+
+
+def test_the_sweep_does_not_touch_real_state(state, internal):
+    """Only temp prefixes are swept: a crash clean-up must never delete state."""
+    survivors = ["state.json", "keyring.json", "audit.jsonl"]
+    call(state, op="read", actor="maya", asset="brief", request_id="sweep-safe")
+    for name in survivors:
+        assert (internal / name).exists(), f"the sweep deleted {name}"
+    assert (internal / "assets").is_dir()

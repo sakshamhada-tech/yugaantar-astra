@@ -420,6 +420,30 @@ offline container. `tests/test_dashboard.py` holds it to the adapter's answers s
 cannot drift into showing something the system would not actually do — that test caught a
 real drift while it was being written.
 
+## 1h. The submission documents
+
+The brief asks for **two** items: a two-page PDF and a five-minute video. Nothing else is
+assessed, and no repository document substitutes for either.
+
+The PDF is generated from `docs/BRIEF.md`, which follows the organiser's template — USP,
+architecture with a diagram, demo entry point and video link on page 1; assets, adversaries,
+trust boundaries, assumptions, defenses and exclusions on page 2.
+
+```sh
+pip install reportlab pypdf      # build-time only, not a runtime dependency
+python scripts/build_brief.py    # -> docs/yugaantar-astra-brief.pdf
+```
+
+The script **enforces** the two-page limit instead of trusting it: it fails if the output
+is any number of pages other than two, because a document that silently becomes three
+pages fails a stated requirement, and that should be loud at build time rather than
+discovered by a reviewer.
+
+Two placeholders still need filling before submission: the team member names, and the video
+URL. `docs/EVIDENCE.md` remains the optional per-goal evidence sheet — the template is
+explicit that it is **not** a third submission item, so it stays in the repository and is
+not attached.
+
 ## 2. Clean-machine setup (tested)
 
 Tested on Linux x86_64 with CPython 3.11 and 3.12; the judging runtime is

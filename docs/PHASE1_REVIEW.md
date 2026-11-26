@@ -113,6 +113,13 @@ $ PYTHONPATH=src:. python -m pytest tests -q
 $ PYTHONPATH=src:. /tmp/fbc/bin/python -m pytest tests -q   # pycryptodome-only venv
 140 passed in 4.57s
 
+$ ./scripts/verify_container_contract.sh /path/to/Track-4-Toolkit
+  code dir is read-only: ok
+  {"ready": true} / {"decision":"allow",...} / {} / {"decision":"deny",...}
+  139 passed, 1 skipped
+  PASS: 22   FAIL: 0
+  == all container-contract checks passed ==
+
 $ ./scripts/verify_install.sh
   detected backend: {'symmetric': 'cryptography', 'aead': True, 'x25519': True, 'pqcrypto': '0.4.0'}
   139 passed, 1 skipped

@@ -17,8 +17,8 @@ VENV="$(mktemp -d)/venv"
 echo "== fresh venv: $VENV =="
 "$PYTHON" -m venv "$VENV"
 "$VENV/bin/pip" -q install --upgrade pip
-echo "== installing requirements.lock =="
-"$VENV/bin/pip" -q install -r "$REPO/requirements.lock"
+echo "== installing requirements.lock + requirements-dev.lock (wheels only) =="
+"$VENV/bin/pip" -q install --only-binary=:all: -r "$REPO/requirements.lock" -r "$REPO/requirements-dev.lock"
 
 echo "== import smoke test =="
 "$VENV/bin/python" - <<'PY'

@@ -46,7 +46,9 @@ scripts/verify_install.sh clean-machine install + test + validator
 scripts/demo_lost_device.py the lost-device walkthrough, with on-disk evidence
 docs/SECURITY_NOTES.md   per component: attack stopped, and the limits
 docs/PHASE1_REVIEW.md    self-review, desk-review Q&A, checklist coverage
-requirements.txt / .lock pinned dependencies
+docs/PLATFORM_SUPPORT.md macOS + Linux wheel matrix, what was actually run
+Dockerfile               Python 3.12 / linux-amd64 image, offline-capable
+.github/workflows/       tests on Linux, organizer validator, docker build
 ```
 
 ---
@@ -61,7 +63,8 @@ git clone <this repo> && cd yugaantar-astra
 
 python3.12 -m venv .venv          # 3.12 matches the judging runtime
 . .venv/bin/activate
-pip install -r requirements.lock  # fully pinned, includes transitive deps
+pip install --only-binary=:all: \
+  -r requirements.lock -r requirements-dev.lock   # fully pinned; wheels only
 
 # 1. run the tests
 PYTHONPATH=src:. python -m pytest tests -q
@@ -80,6 +83,34 @@ One command does all three (toolkit path optional):
 ```sh
 ./scripts/verify_install.sh /path/to/Track-4-Toolkit
 ```
+
+### Docker (Python 3.12, linux/amd64)
+
+```sh
+docker build --platform linux/amd64 -t pqc-kv:phase1 .
+
+# tests inside the image
+docker run --rm pqc-kv:phase1 python -m pytest tests -q
+
+# the adapter exactly as the judge runs it: read-only root, temp-only state
+printf '%s' '{"op":"setup","owners":{"brief":"maya"},"contents":{"brief":"demo"}}' \
+  | docker run --rm -i --read-only --tmpfs /tmp pqc-kv:phase1
+
+# organizer validator against the image (toolkit mounted, never copied in)
+docker run --rm -v /path/to/Track-4-Toolkit:/toolkit:ro \
+  -v "$PWD/track4_service.py:/toolkit/track4_service.py:ro" \
+  -v "$PWD/team_app.py:/toolkit/team_app.py:ro" \
+  -v "$PWD/src:/toolkit/src:ro" --tmpfs /tmp \
+  pqc-kv:phase1 python /toolkit/validate.py --entry /toolkit/track4_service.py
+```
+
+The image installs only prebuilt wheels (`PIP_ONLY_BINARY=:all:`), bakes every
+dependency in for offline judging, runs as UID 10001, and deliberately leaves
+`TRACK4_STATE_DIR` unset so the default path is the OS-temp fallback the judge uses.
+
+If you have no Docker, `./scripts/verify_container_contract.sh <toolkit>` reproduces
+the same contract locally: read-only code directory, temp-only state, wheels-only
+install, full suite and the validator.
 
 ### Expected outputs
 
@@ -127,12 +158,20 @@ Demo (abridged) — note that no plaintext and no key material appears on disk:
 
 ## 3. Dependencies and why these
 
+**Cross-platform:** every pin has a prebuilt wheel for CPython 3.12 on
+linux/amd64, linux/arm64 and macOS arm64 — no compiler on either your Mac or the
+judge's Linux box. Full matrix and caveats: `docs/PLATFORM_SUPPORT.md`.
+
 | Package | Version | Used for | Why this one |
 | --- | --- | --- | --- |
 | `pqcrypto` | `0.4.0` | ML-KEM-768, ML-DSA-65 | **The exact pinned version the judging container ships.** pqclean C implementations of the NIST standards (FIPS 203 / 204), prebuilt wheels, no compiler needed. |
 | `cryptography` | `46.0.4` | AES-256-GCM, HKDF-SHA256, X25519 | Widely deployed, audited, constant-time primitives; abi3 wheels for Python 3.9+. |
 | `pycryptodome` | `3.23.0` (optional) | same surfaces as `cryptography` | Fallback only. Used automatically if `cryptography` is absent; verified by running the full suite with it (140 passed). |
-| `pytest` | `9.0.1` | tests | dev only, not needed at run time. |
+| `pytest` | `9.0.1` | tests | dev only; in the image because the image is also where we run the suite. |
+
+The build refuses source builds: `PIP_ONLY_BINARY=:all:` is set in the `Dockerfile`
+and passed on the command line in the docs, so a missing wheel fails loudly at
+install time instead of silently dragging in a compiler.
 
 **Choice: Python 3.12 + `pqcrypto==0.4.0` + `cryptography==46.0.4`.**
 

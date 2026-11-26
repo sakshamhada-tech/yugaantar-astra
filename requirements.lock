@@ -1,12 +1,9 @@
-# Auto-generated: full transitive pins from a clean venv (Linux x86_64).
-# Regenerate: pip install -r requirements-dev.txt && pip freeze > requirements.lock
-# Note: exact versions that resolved on 2026-11-26 with Python 3.11/3.12.
+# Fully pinned, resolved with:
+#   pip install -r requirements-dev.txt && pip freeze
+# Regenerated on 2026-11-26 (Linux x86_64, CPython 3.11/3.12).
+# Runtime pins only. All are prebuilt wheels for cp312 on linux/amd64,
+# linux/arm64 and macOS arm64 -- see docs/PLATFORM_SUPPORT.md.
 cffi==2.1.1
 cryptography==46.0.4
-iniconfig==2.3.1
-packaging==26.4
-pluggy==1.7.0
 pqcrypto==0.4.0
 pycparser==3.12
-Pygments==2.21.0
-pytest==9.0.1

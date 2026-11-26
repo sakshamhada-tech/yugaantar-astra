@@ -1,0 +1,96 @@
+name: verify
+
+# Every claim in README/docs is checked here on real Linux runners:
+# tests on 3.12 (and 3.13 as an early-warning canary), the organizer validator,
+# and the Dockerfile itself (build + run + tests + validator inside the image).
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests (ubuntu, py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12"]
+        include:
+          - python: "3.13"
+            experimental: true
+    continue-on-error: ${{ matrix.experimental || false }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.lock
+            requirements-dev.lock
+      - name: Show interpreter
+        run: "python -V"
+      - name: Install pinned deps (wheels only, no compiler)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --only-binary=:all: -r requirements.lock -r requirements-dev.lock
+      - name: Test
+        run: "PYTHONPATH=src:. python -m pytest tests -q"
+      - name: Lost-device walkthrough (checks no plaintext at rest)
+        run: "python scripts/demo_lost_device.py"
+
+  validator:
+    name: organizer validator (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned deps
+        run: "pip install --only-binary=:all: -r requirements.lock"
+      - name: Fetch the toolkit (kept outside the repo)
+        run: git clone --depth 1 https://github.com/ScalerOpenSourceLabs/Track-4-Toolkit.git /tmp/toolkit
+      - name: quickstart (toolkit self-check)
+        working-directory: /tmp/toolkit
+        run: "python quickstart.py"
+      - name: Validate our adapter
+        working-directory: /tmp/toolkit
+        run: python validate.py --entry "$GITHUB_WORKSPACE/track4_service.py"
+
+  docker:
+    name: docker image (linux/amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build
+        run: docker buildx build --platform linux/amd64 --load -t pqc-kv:phase1 .
+      - name: Tests inside the image
+        run: docker run --rm pqc-kv:phase1 python -m pytest tests -q
+      - name: Adapter inside the image, read-only root, temp-only state
+        run: |
+          printf '%s' '{"op":"setup","owners":{"brief":"maya"},"contents":{"brief":"ro body"},"disabled":[],"key_material":"MARKER"}' \
+            | docker run --rm -i --read-only --tmpfs /tmp pqc-kv:phase1
+          printf '%s' '{"op":"read","actor":"maya","asset":"brief","request_id":"r1"}' \
+            | docker run --rm -i --read-only --tmpfs /tmp pqc-kv:phase1
+      - name: Organizer validator against the image
+        run: |
+          git clone --depth 1 https://github.com/ScalerOpenSourceLabs/Track-4-Toolkit.git toolkitchk
+          docker run --rm \
+            -v "$PWD/toolkitchk:/toolkit:ro" \
+            -v "$PWD/track4_service.py:/toolkit/track4_service.py:ro" \
+            -v "$PWD/team_app.py:/toolkit/team_app.py:ro" \
+            -v "$PWD/src:/toolkit/src:ro" \
+            --tmpfs /tmp \
+            pqc-kv:phase1 python /toolkit/validate.py --entry /toolkit/track4_service.py
+      - name: Confirm no secrets or toolkit files in the image
+        run: |
+          docker run --rm --entrypoint sh pqc-kv:phase1 -c \
+            'test -z "$(find /app -name "*.key" -o -name "*.pem" -o -name ".env")"' \
+            && echo "image contains no key material"

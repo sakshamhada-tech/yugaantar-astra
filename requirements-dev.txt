@@ -1,0 +1,3 @@
+# Dev / test pins. The runtime needs only requirements.txt.
+-r requirements.txt
+pytest==9.0.1

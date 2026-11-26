@@ -1,0 +1,45 @@
+# Never put keys, state, or local environments in a build context or image.
+# If any of these are present, the build should fail loudly rather than bake them in.
+state/
+.pqc-kv-keys/
+*.key
+*.pem
+.env
+.env.*
+secrets/
+*.secret
+
+# Local tooling / caches
+.git/
+.gitignore
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Organizer toolkit must never be copied into this repo or image
+Track-4-Toolkit/
+toolkit/
+validate.py
+quickstart.py
+starters/
+demo/
+practice/
+templates/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Not needed by the runtime image
+requirements*.in
+requirements-dev.txt
+README.md
+Dockerfile
+.dockerignore

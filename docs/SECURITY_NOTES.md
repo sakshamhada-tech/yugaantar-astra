@@ -1078,3 +1078,124 @@ byte-for-byte, and by running a log with its rows reversed.
    sandbox could not install it.
 8. **Not run on macOS.** `unshare`-free operation is fine (the detector uses no such
    facility), but "works on macOS" is untested here, as with Phase 3.
+
+---
+
+# Phase 5 — messaging goals 9-12, attacked rather than asserted
+
+Phase 2 built goals 9-12. Phase 5 asks a different question: **do they survive the
+attacks the brief names?** The answer is yes, but writing the proof found three places
+where the existing suite tested the mechanism and not the property, and two places where
+the new gate could have produced a false PASS.
+
+The gate is `python scripts/phase5_acceptance.py` — 17 checks, real subprocesses.
+
+## P5-1. What the existing suite missed
+
+| Goal | Was tested | Was not tested | Why it matters |
+| --- | --- | --- | --- |
+| 10 | ephemeral files are erased after establishment | that earlier sessions stay unreadable when **every** long-term key is exposed | Erasure is the mechanism; unreadability is the claim. A build could erase the files and still derive the root from long-term keys, and pass every previous test. |
+| 11 | `delivered == []` on a tampered fragment | that a failure is **reported** with a reason and message id | A silent drop and a reported `signature_invalid` were indistinguishable to the tests, and only one is usable in an incident. |
+| 12 | wrong-key proof, wrong-peer ticket, unknown ticket, budget | a thief holding **both** the ticket id and the session id | That is the exact sentence in the brief, and it was the one case with no test. |
+
+New: `tests/test_messaging_forward_secrecy.py` (7),
+`tests/test_messaging_resumption_binding.py` (9),
+`tests/test_messaging_delivery_reports.py` (13). Suite 759 → 788.
+
+## P5-2. Forward secrecy: how the claim is actually tested
+
+The brief says *later exposure of a long-term identity key alone does not reveal the
+contents of earlier, completed sessions.* The test grants the attacker the strongest
+position the wording allows — **every** long-term secret of both parties, plus every
+public value on the wire — and denies only the ephemeral secrets.
+
+The important subtlety: **ML-KEM is implicitly rejecting.** Decapsulating the ephemeral
+ciphertext with a long-term key does not raise; it returns an unrelated shared secret of
+the correct length. So "decapsulation failed" is not a checkable event, and a test that
+asserted an exception would be asserting a false premise. The honest test runs the whole
+derivation and compares the resulting root against the real one:
+
+* `hs.derive_root(parts, forged_x25519, forged_pq)` never equals either party's root, for
+  three blind X25519 guesses (0 matches).
+* No send or receive chain key derived from any forged root matches either.
+* The initiator's ephemeral record is gone from disk (`EphemeralError` on load).
+* The responder never persists an ephemeral at all — a design choice that halves the
+  ephemeral-secret surface.
+
+**Limit, stated because it is real:** this tests that long-term keys do not *reconstruct*
+the session. It does not model an attacker who obtains the ephemeral secrets *before*
+erasure (a memory disclosure between step 1 and step 3), and it does not claim
+post-compromise security for the ratchet — no such claim is made anywhere in this
+project.
+
+## P5-3. Recipient binding: why the reason code is the test
+
+Recipient binding runs **before** signature verification, by design (cheapest and most
+restrictive first). That ordering creates a trap for testing: if recipient binding is
+disabled, a re-addressed fragment still fails — as `signature_invalid`, because the
+signature is the backstop.
+
+An earlier version of the goal-9 check accepted any failure reason, and therefore
+reported **17/17 with recipient binding deleted outright.** The check now requires
+`wrong_recipient` specifically, and the same deletion produces **15/17** with the message
+"refused by recipient binding as 'signature_invalid'" — which names the cause rather than
+hiding it. Both recipient fields (`ru`, `rfp`) are asserted separately.
+
+Also pinned: after a forged attempt the genuine fragments still deliver the exact body,
+so a forgery cannot consume or poison the real message. Unknown header keys are ignored
+rather than authenticated, so extra keys can neither smuggle meaning nor break a
+message — both directions asserted, because "ignored" is either harmless or a bypass
+depending on which side of the signature it lands.
+
+## P5-4. Delivery under loss, and what "reports failures" means
+
+Every failure is a closed shape: `{"reason", "message_id"}` and nothing else. Asserted
+directly — a report that carried plaintext or key material would turn the log into the
+leak. Incomplete → `incomplete`; forged → `signature_invalid`; partial then rest →
+delivers exactly once; a further replay → 0 delivered and 5 duplicates counted.
+
+A forged fragment must not desynchronise the receiver: the ratchet is only advanced after
+the manifest signature verifies and every fragment decrypts, so dropping bad fragments is
+not a cheap denial of service. Pinned by
+`test_a_failed_message_does_not_consume_the_ratchet`.
+
+## P5-5. Resumption: who may inherit a session
+
+Three refusals added beyond the existing suite:
+
+* a thief with the ticket id **and** the session id, using its own key → `wrong_peer`;
+* a genuine ticket presented against a different session id → `wrong_peer`;
+* a right-peer signature made over a *different* ticket's challenge → `proof_invalid`.
+
+A spent ticket is **deleted**, not flagged, so a second redemption reports
+`unknown_ticket` rather than `ticket_expired`. Both are refusals; the distinction is
+recorded because single-use here is enforced by deletion, not by a boolean. Refusal
+messages carry no ticket id, challenge or signature — asserted, so the error cannot
+become an oracle.
+
+## P5-6. A false PASS found in the gate's own tooling
+
+The first draft of the goal-10 test copied fragments with `dict(f)`. That is a **shallow**
+copy, so mutating the "forged" fragment's nested header silently rewrote the genuine one.
+The symptom was a correct detector appearing to lose a message after a forgery — which
+reads exactly like a real vulnerability. Fixed with `deepcopy`, and commented at the site.
+
+This is the third time in this project that a test-side mistake produced a symptom that
+looked like a product defect. The general lesson, now applied in both gates: **when a
+check fails, first establish whether the check or the code is wrong**, and write down
+which, because a fixture bug that is silently "fixed" by loosening an assertion is how a
+gate stops measuring anything.
+
+## P5-7. Known limits of Phase 5
+
+1. **No post-compromise security claim.** Forward secrecy means past sessions stay
+   secret. It does not mean the session self-heals after a key compromise.
+2. **The adversary is key-level, not timing-level.** Side channels, memory disclosure
+   and fault injection are out of scope, as in Phases 1-3.
+3. **Resumption budget is a count, not a clock.** Expiry without a trusted clock is a
+   deliberate decision carried from Phase 2; a stolen ticket is bounded by redemptions,
+   not by time.
+4. **The goal-10 check is in-process.** It must be: the attack needs the wire messages,
+   which the adapter keeps. Every other Phase 5 check drives a subprocess.
+5. **Still not run on macOS**, and no real network was used — the "nodes" are
+   directories and processes on one machine.

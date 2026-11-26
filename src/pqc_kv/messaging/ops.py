@@ -77,13 +77,10 @@ def _policy():
     """
 
     def policy(user_id: str, action: str) -> bool:
-        try:
-            state = StateStore(_root())._read_state()
-        except Exception:
-            # No setup yet: messaging is still usable, and "not revoked" is the
-            # safe default for an identity that was never registered.
-            return True
-        return user_id not in state.get("disabled", [])
+        # StateStore.is_revoked takes the store's lock and returns False when no
+        # setup has run, which is the right default: messaging is usable for an
+        # identity that was never registered, and a revocation is an explicit act.
+        return not StateStore(_root()).is_revoked(user_id)
 
     return policy
 
@@ -165,7 +162,10 @@ def dispatch(request: dict) -> dict:
             confirm, keys = hs.complete(
                 identity=who, accept=accept, state_root=_root(), peer=peer
             )
-            _create_session(keys, accept.session_id)
+            # Emitting the confirm finishes the handshake for the initiator: there is
+            # no fourth message. The responder only becomes confirmed once it
+            # verifies this confirm, which is why msg_handshake_confirm sets its own.
+            _create_session(keys, accept.session_id, confirmed=True)
             return {"confirm": confirm.to_dict(), "session_id": accept.session_id}
 
         if op == "msg_handshake_confirm":
@@ -287,9 +287,8 @@ def dispatch(request: dict) -> dict:
     raise OpsError("unsupported_operation")
 
 
-def _create_session(keys: hs.SessionKeys, session_id: str) -> None:
+def _create_session(keys: hs.SessionKeys, session_id: str, *, confirmed: bool = False) -> None:
     """Persist a new session's ratchet state. Secrets stay in the state directory."""
-    public = identity.PublicIdentity  # noqa: F841 - documentation only
     session = {
         "self_user": keys.self_user,
         "self_fp": keys.self_fp,
@@ -306,7 +305,7 @@ def _create_session(keys: hs.SessionKeys, session_id: str) -> None:
         "next_message_id": "m-00000001",
         "seen_ids": [],
         "partials": {},
-        "confirmed": False,
+        "confirmed": confirmed,
     }
     _sessions().put(session_id, session)
 

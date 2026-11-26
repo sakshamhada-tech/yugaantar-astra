@@ -211,3 +211,41 @@ def test_no_secrets_in_messaging_output(tmp_path):
         for blob in blobs:
             assert secret.hex() not in blob
             assert base64.b64encode(secret).decode() not in blob
+
+
+def test_is_revoked_public_query(tmp_path):
+    """The query messaging relies on: explicit, locked, false before setup."""
+    sys.path.insert(0, str(ROOT / "src"))
+    from pqc_kv.store import StateStore
+
+    empty = StateStore(tmp_path / "never-set-up")
+    assert empty.is_revoked("alice") is False
+
+    state = tmp_path / "s"; state.mkdir()
+    ok(state, op="setup", owners={"brief": "alice"}, contents={"brief": "x"},
+       disabled=[], key_material="k")
+    store = StateStore(state)
+    assert store.is_revoked("alice") is False
+    ok(state, op="revoke", actor="alice")
+    assert state and store.is_revoked("alice") is True
+    assert store.is_revoked("bob") is False
+
+
+def test_both_sides_report_confirmed_at_different_times(tmp_path):
+    """The handshake has three messages, so the two sides finish at different steps.
+
+    The initiator is done the moment it emits the confirm; the responder is only
+    done once it has verified that confirm. Getting this wrong is invisible in a
+    message round trip (the keys already agree) but misreports session state.
+    """
+    alice_dir, bob_dir, *_ = setup_two_parties(tmp_path)
+    hello = ok(alice_dir, op="msg_handshake_init", self_user="alice", peer_user="bob")
+    accept = ok(bob_dir, op="msg_handshake_finish", self_user="bob", hello=hello["hello"])
+    confirm = ok(alice_dir, op="msg_handshake_complete", self_user="alice", accept=accept["accept"])
+    session_id = hello["session_id"]
+
+    assert ok(alice_dir, op="msg_status", session_id=session_id)["confirmed"] is True
+    assert ok(bob_dir, op="msg_status", session_id=session_id)["confirmed"] is False
+
+    ok(bob_dir, op="msg_handshake_confirm", self_user="bob", confirm=confirm["confirm"])
+    assert ok(bob_dir, op="msg_status", session_id=session_id)["confirmed"] is True

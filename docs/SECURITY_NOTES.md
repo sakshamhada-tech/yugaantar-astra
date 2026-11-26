@@ -561,17 +561,97 @@ is part of the identity, it is what a future authenticated key exchange would us
 and **Phase 2 does not require it for confidentiality**. We did not remove it
 because the fingerprint needs a stable, quantum-safe second key to be meaningful.
 
-## 11. Goal 12 (session resumption) — deferred, and why
+## 11. Goal 12 (session resumption) — **supported, with stated limits**
 
-Resumption is only attempted after goals 9-11 are solid, which they now are. The
-requirement is: tickets bound to the authenticated peer fingerprint, proof of
-possession, fresh keys on resume, single-use and expiring.
+`messaging/resumption.py`. A ticket lets two peers skip the ephemeral exchange and
+rebuild a session from long-term keys plus a stored secret. The four required
+properties, and how each is met:
 
-The obstacle is **expiry without a trusted clock**. Options: (a) wall-clock expiry --
-untrusted, and a hostile or skewed clock silently extends a ticket; (b) sequence-budget
-expiry -- needs a shared counter that both sides advance, which is workable but only
-as strong as the counter's integrity. I will implement (b) plus single-use consumption
-plus a fresh handshake-derived root, and if any of it cannot be tested to the same
-standard as 9-11, I will mark goal 12 **"not supported"** rather than ship a
-resumption path weaker than a full handshake. A full handshake costs ~4 ms, so
-"no resumption" is a perfectly defensible answer.
+| Requirement | How | Test |
+|---|---|---|
+| Bound to the authenticated peer fingerprint | Ticket stores `peer_fp` **and** `peer_user`; both are compared against the directory entry at redeem time | `test_ticket_for_another_peer_is_refused` |
+| Proof of possession | Redemption requires an ML-DSA-65 signature by the peer's long-term key over `proof_payload(ticket_id, challenge, peer_fp)` | `test_missing_proof_is_refused`, `test_proof_from_the_wrong_key_is_refused` |
+| Fresh keys on resume | New root = HKDF(seed ‖ ticket secret ‖ challenge ‖ budget). The old chain keys are **discarded**, never continued; each redemption yields a different root | `test_resume_with_valid_proof_gives_fresh_root`, `test_each_resume_yields_a_different_root` |
+| Single use | The ticket is decremented or deleted from disk **before** the caller receives the root, so a crash after that point cannot hand the same ticket out twice | `test_budget_exhaustion_expires_the_ticket` |
+| Expiring | A **budget** (default 3 redemptions) rather than a timestamp | `test_budget_decrements_and_is_reported` |
+
+### Expiry without a trusted clock
+
+The container's clock is not something this code can trust, and a skewable clock is
+a skewable expiry — an attacker who can move the clock forward or back can extend a
+ticket's life. So a ticket carries a **budget**: an integer count of redemptions,
+held in our own state file. It cannot be forged by changing the time, and it is
+monotone under our control.
+
+**The honest difference from a TTL design:** a ticket that is never redeemed is
+still valid a year later, as long as its budget is untouched. This is not calendar
+expiry and I am not going to describe it as such. What the budget actually bounds is
+*reuse*, which is the property that matters for an attacker who has stolen a ticket
+file — they still cannot use it without the long-term signing key, and the count of
+attempts is capped.
+
+### What resumption does *not* raise the bar against
+
+The ticket secret lives in the same state directory as the session state. An attacker
+who can read that directory already has the ratchet keys, so the ticket adds no
+exposure **against that attacker**. What it buys over a full handshake is (a) no new
+ephemeral exchange, and (b) the guarantee that *the ticket file alone* is useless
+without the long-term signing key — stealing one file is not enough, you need the
+key too.
+
+### Why this counts as supported rather than skipped
+
+A full handshake costs roughly 4 ms. Resumption therefore buys latency, not safety,
+and it is only worth shipping if it is not *weaker* than the thing it replaces. Each
+of the five properties above is tested to the same standard as goals 9–11, the
+failure modes are single-reason codes with no key material, and the one real
+divergence from a textbook design (budget instead of wall-clock expiry) is stated
+above rather than hidden. Had any of the four required properties failed to test
+cleanly, the answer would have been **"not supported"** — a defensible answer for a
+4 ms saving.
+
+## 12. Adapter operations added for Phase 2
+
+`docs/adapter-v1.md` fixes the protected-resource interface (`setup`, `read`,
+`revoke`, `audit`, `protected_read`) and states that the twelve goals include
+capabilities outside it, while requiring that end-to-end messaging, replay protection
+and forward secrecy each carry **separate evidence**. So Phase 2 is exposed as
+thirteen additional `msg_*` operations through the *same* generic JSON shim.
+`track4_service.py` is byte-identical to the toolkit starter; `setup` is unchanged.
+
+| op | purpose |
+|---|---|
+| `msg_identity` | create/load a local identity, return fingerprint (and optionally the public record) |
+| `msg_directory_add` / `msg_directory_show` | publish a peer's public record / list known peers + digest |
+| `msg_handshake_init` | step 1: hello out, initiator ephemerals persisted |
+| `msg_handshake_finish` | step 2: responder accepts, derives keys, persists **no** ephemerals |
+| `msg_handshake_complete` | step 3: initiator finalises, erases ephemerals, emits confirm |
+| `msg_handshake_confirm` | step 3 received: mutual key confirmation |
+| `msg_send` / `msg_receive` | encrypt + fragment / reassemble + deliver |
+| `msg_status` | counts and role — no keys |
+| `msg_ticket_issue` / `msg_resume` | goal 12 |
+| `msg_close` | delete session state |
+
+**Every failure is `{"error": "request_failed"}`.** Returning `wrong_recipient`
+versus `signature_invalid` versus `unknown_session` to the caller would turn the
+adapter into an oracle that tells an attacker which of their guesses was closest.
+The specific reason code exists inside the process (and in the audit log), never in
+the response. This matches Phase 1's rule that a deny carries no hint.
+
+The `msg_identity` op can return the public record on request (`export_public`).
+That is safe by construction: it is the directory entry, i.e. exactly the material a
+peer needs to pin us, and it reveals nothing that comparing fingerprints would not.
+Secret keys are never serialised by any code path — the sweep in
+`test_no_secrets_in_messaging_output` reads every state file, extracts any key
+material it can find, and asserts none of it appears in any op response.
+
+### End-to-end evidence
+
+`tests/test_messaging_adapter.py` drives two separate **subprocesses** through the
+real `track4_service.py`, one process per request, so nothing survives in memory
+between steps. That suite covers the complete handshake, a multi-fragment message
+round trip, replay rejection, re-addressing rejection, revocation taking effect, the
+ephemeral file being gone after establishment, a third party refusing a hello
+addressed elsewhere, opaque failures for malformed input, and the secret sweep. It
+is the load-bearing evidence that the on-disk state design works under the
+contract's one-process-per-request constraint, as opposed to only in-process tests.

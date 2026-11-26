@@ -49,6 +49,15 @@ jobs:
         run: "python scripts/phase3_acceptance.py"
       - name: Phase 3 crash-recovery kills (real subprocesses, 5 fault points)
         run: "python -m pytest tests/test_phase3_recovery.py -q"
+      - name: Phase 4 detector evaluation (practice + synthetic, prints F1 and F1 method)
+        run: |
+          git clone --depth 1 https://github.com/ScalerOpenSourceLabs/Track-4-Toolkit.git /tmp/toolkit
+          python scripts/phase4_synth.py --out /tmp/synth
+          python scripts/phase4_eval.py --practice /tmp/toolkit/practice --synthetic /tmp/synth
+      - name: Phase 4 mutation check (each rule must be caught by a test)
+        run: |
+          python scripts/phase4_mutate.py --log /tmp/synth/events.csv \
+            --approvals /tmp/synth/approvals.json --tests
 
   validator:
     name: organizer validator (ubuntu)

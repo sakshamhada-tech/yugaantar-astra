@@ -60,9 +60,15 @@ GENESIS = "0" * 64
 MAX_ID_LEN = 96
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._@:#-]*$")
 
+#: The allow-list is extended deliberately, one action at a time, and never by
+#: accepting an arbitrary string. ``detect`` records a Phase 4 high-severity
+#: detection: a privilege change or a lateral-movement finding, recorded so the
+#: finding itself becomes tamper-evident. The record carries the rule name and the
+#: alert id (both validated identifiers), not the human-readable explanation --
+#: keeping the prose out is what lets this list stay strict.
 ALLOWED_ACTIONS = frozenset({
     "read", "revoke", "rotate", "recover", "restore", "backup",
-    "enrol", "policy", "setup", "message",
+    "enrol", "policy", "setup", "message", "detect",
 })
 
 

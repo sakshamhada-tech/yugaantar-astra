@@ -60,6 +60,11 @@ KEY_OPS = {"rotate", "key_status", "log_verify", "log_head", "recover",
 # capabilities outside its protected-resource interface, and explicitly notes that
 # end-to-end messaging, replay protection and forward secrecy need separate
 # evidence. track4_service.py stays byte-identical to the starter.
+# Phase 4: detection operations (checklist goals 6, 7, 8). Additions again, for the
+# same reason as Phases 2 and 3 -- the contract says the twelve goals include
+# capabilities outside its protected-resource interface. `track4_service.py` is
+# untouched, and an unknown op still returns `unsupported_operation`.
+DETECT_OPS = {"detect_log", "detect_append", "detect_status"}
 MESSAGING_OPS = {
     "msg_identity", "msg_directory_add", "msg_directory_show",
     "msg_handshake_init", "msg_handshake_finish", "msg_handshake_complete",
@@ -81,6 +86,8 @@ def dispatch(request: dict) -> dict:
     op = request.get("op")
     if op in MESSAGING_OPS:
         return _dispatch_messaging(request)
+    if op in DETECT_OPS:
+        return _dispatch_detect(request)
     if op in KEY_OPS:
         return _dispatch_keys(request)
     if op not in SUPPORTED_OPS:
@@ -197,6 +204,89 @@ def _dispatch_messaging(request: dict) -> dict:
         # Never surface a messaging reason code to the caller: `wrong_recipient`
         # vs `signature_invalid` would be an oracle. One answer, like Phase 1.
         return {"error": "request_failed"}
+
+
+# --------------------------------------------------------------------- Phase 4
+def _dispatch_detect(request: dict) -> dict:
+    """Detection operations: goals 6, 7 and 8.
+
+    Two behaviours worth knowing:
+
+    * The report *is* the answer. It carries the alerts, the counts of what was
+      refused and why, the supported timing range, and per-source clock corrections,
+      so a caller can audit the run without a second request.
+    * High-signal findings are also written into the Phase 3 signed key-event log,
+      so that a privilege-change or lateral-movement alert becomes tamper-evident
+      rather than living only in a JSON response. The log's field policy is not
+      weakened to make that work: the record carries ``rule`` and ``alert_id``, which
+      are the detector's own validated tokens, never the prose explanation.
+    """
+    op = request.get("op")
+    try:
+        from pqc_kv.detect import ops as detect_ops
+
+        handler = detect_ops.OPS[op]
+        result = handler(request)
+        if isinstance(result, dict) and result.get("error"):
+            return result
+        if op in ("detect_log", "detect_append"):
+            _record_detections(result)
+        return result
+    except Exception:
+        # One opaque failure, as everywhere else. A detector that explained its
+        # own crash would be a debugging interface for hostile input.
+        return {"error": "request_failed"}
+
+
+def _record_detections(result: dict) -> None:
+    """Append high-signal detections to the signed key-event log, best-effort.
+
+    Reports *whether* it happened, in ``detections_signed``, rather than claiming
+    success silently. Two reasons it can be skipped:
+
+    * no alerts reached the recording bar (low-severity and follow-on findings are
+      deliberately excluded -- see ``detect_ops.RECORDABLE_RULES``);
+    * the adapter's own state has not been set up, so there is no key-event log to
+      write to. Detection must work without the KV store being initialised, because
+      these are separate capabilities: a caller may want detection over a log with
+      no assets configured at all.
+
+    A log write never changes the detection answer. Detection is the product; the
+    log is the audit trail of it.
+    """
+    result["detections_signed"] = 0
+    alerts = result.get("alerts") or []
+    if not alerts:
+        return
+    try:
+        from pqc_kv.detect import ops as detect_ops
+
+        store = _store()
+        # `record_event` raises when setup has not run. Check first, so the skip is a
+        # reported fact rather than an exception we swallow.
+        store._read_state()
+    except Exception:
+        result["detections_signed_error"] = "adapter_state_not_initialised"
+        return
+    written = 0
+    try:
+        for entry in alerts:
+            if entry.get("rule") not in detect_ops.RECORDABLE_RULES:
+                continue
+            if entry.get("severity") not in ("high", "medium"):
+                continue
+            # Colon is in the log's identifier charset; "/" is not. Using a
+            # separator the policy accepts is the right fix -- loosening the policy
+            # for our own convenience is not.
+            detail = f"{entry['rule']}:{entry['alert_id']}"
+            store.record_event("detect", actor=entry.get("identity", ""),
+                               detail=detail)
+            written += 1
+    except Exception:
+        # A log failure must not fail the detection. The count says how far it got,
+        # and `log_events_verify` shows the chain's own state.
+        result["detections_signed_error"] = "log_write_failed"
+    result["detections_signed"] = written
 
 
 # --------------------------------------------------------------------- Phase 3

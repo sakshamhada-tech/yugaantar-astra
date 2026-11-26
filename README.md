@@ -165,6 +165,70 @@ backup rollback are in the directory the backup protects. All simulated nodes sh
 machine, so no real network partition was tested. Full list in
 `docs/SECURITY_NOTES.md` §P3-7. The mutation log is `docs/BREAK_IT.md`.
 
+## 1d. Phase 4 — detection (goals 6, 7, 8)
+
+Rule-based, explainable and deterministic. **No model, no weights, no learning**: every
+alert is a conjunction of facts a judge can re-derive by hand from the log and the
+approval file.
+
+| Goal | Module | What it does | Evidence |
+| --- | --- | --- | --- |
+| 6. Routine vs suspicious | `detect/privilege.py` + `detect/context.py` | A privilege change is suspicious when no approval covers subject, role, window and signer. The alert names the fact that failed | `tests/test_phase4_rules.py` (29) |
+| 7. Lateral movement | `detect/lateral.py` | Per-identity service graph from a baseline period; flags first-seen edges and chains that leave a freshly-reached service, even when credentials are valid | `tests/test_phase4_lateral.py` (28) |
+| 8. Clock differences | `detect/timing.py` | Per-source offset correction with a stated uncertainty. An order is claimed only when the gap exceeds the combined uncertainty; otherwise `order="uncertain"` | `tests/test_phase4_timing.py` (25) |
+
+Plus `detect/ingest.py` (strict, counted rejection of hostile lines, 156 tests),
+`tests/test_phase4_properties.py` (28 determinism/config/injection tests),
+`detect/alerts.py` (closed schema, content-derived ids) and `detect/config.py` (every
+threshold in one validated place).
+
+New adapter ops, all additive — `track4_service.py` is still byte-identical:
+`detect_log` (whole log in one request), `detect_append` (persists a baseline under
+`TRACK4_STATE_DIR`), `detect_status`. High-severity findings are also written into the
+Phase 3 **signed** key-event log, so a detection becomes tamper-evident.
+
+### Run the evaluation on a clean machine
+
+```sh
+python -m pytest -q                              # whole suite
+python scripts/phase4_eval.py --practice /path/to/Track-4-Toolkit/practice
+python scripts/phase4_synth.py --out /tmp/synth  # MESSY synthetic log, fixed seed
+python scripts/phase4_eval.py --synthetic /tmp/synth
+```
+
+`phase4_eval.py` prints its own method next to every number — how an alert is matched to
+a label, what precision is computed over, and that the headline time-to-alert is 0 by
+construction. Read that before the figures.
+
+Measured on the synthetic log (276 events): **20 alerts, all 20 true positives, 12 of 13
+incidents detected, 0 false alerts per 1,000 benign events**. The one miss is deliberate:
+an attacker who behaves badly *during* the baseline is not novel afterwards, and that
+limit is measured rather than described. Practice data: 3 alerts, 3 hits — a functional
+check only, because 22 events cannot establish accuracy.
+
+Throughput, `python scripts/measure_timing.py /tmp/big/events.csv` on a 100 023-event
+log: **36 944 events/second**, **173 MB peak RSS**, on 2 CPUs / Python 3.11.
+
+### Try the rules yourself
+
+```sh
+# take one rule away and watch exactly which tests and metrics drop
+python scripts/phase4_mutate.py --log /tmp/synth/events.csv \
+    --approvals /tmp/synth/approvals.json --tests
+
+# the uncertain-order answer, when two clocks cannot settle a sequence
+python -m pytest tests/test_phase4_rules.py::test_a_change_in_the_clock_shadow_of_the_bound_is_uncertain_not_judged -q -s
+```
+
+### What Phase 4 does not fix
+
+This is good at unusual **shape** and blind to unusual **purpose**. An attacker who
+stays inside an identity's established service edges is invisible to the lateral rules,
+and an approval record is a *claim*: compromise an approver, or file a real ticket, and
+the privilege rules pass. Precision of 1.000 is precision on my own synthetic corpus.
+Full list in `docs/SECURITY_NOTES.md` §P4-7; rules, evasions and measurements in
+`docs/DETECTION.md`.
+
 ## 2. Clean-machine setup (tested)
 
 Tested on Linux x86_64 with CPython 3.11 and 3.12; the judging runtime is

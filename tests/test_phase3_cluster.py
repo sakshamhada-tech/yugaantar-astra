@@ -322,3 +322,22 @@ def test_propagation_time_is_measured_not_estimated(cluster3):
           f"worst {worst:.1f} ms over {len(samples)} runs (local processes, no network)")
     assert worst < 60_000
     assert len(samples) == 5
+
+
+def test_the_publishing_node_enforces_its_own_notice(cluster3):
+    """Regression: the node that issues a revocation must also obey it.
+
+    Found by the acceptance script: `cluster_publish` left the notice in the outbox
+    for *other* nodes and never applied it locally, so the revoking node was the one
+    node still honouring the old state.
+    """
+    published = call(cluster3.base, cluster3[0], op="cluster_publish",
+                     kind="revoke", payload={"actor": "maya"})
+    assert published["applied_locally"] == 1
+    assert cluster3.read(0, "self0")["decision"] == "deny", (
+        "the publishing node must enforce its own revocation immediately"
+    )
+    # And the others still need to pull, as before.
+    assert cluster3.read(1, "self1")["decision"] == "allow"
+    cluster3.sync(1)
+    assert cluster3.read(1, "self1b")["decision"] == "deny"

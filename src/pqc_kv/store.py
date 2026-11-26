@@ -796,11 +796,32 @@ class StateStore:
             self._write_state(state)
             return digest
 
-    def open_for_protected_read(self, actor: str, asset: str) -> tuple[bool, str | None, str]:
-        """Authorization + body for ``protected_read``. Never records on its own."""
-        state = self._read_state()
-        decision, rule, body = self._decide(state, actor, asset)
-        return decision == "allow", body, rule
+    def protect_read(self, actor: str, asset: str, request_id) -> tuple[bool, str | None, str]:
+        """Authorize AND record a ``protected_read`` in one locked step (TOCTOU fix).
+
+        Phase 1 split this in two: `open_for_protected_read` read the policy with no
+        lock, then `record_external` took the lock afterwards to write the audit
+        record. Between those two calls a revocation committed by another process was
+        read by nobody, so a just-revoked actor could still be served. Found in the
+        Phase 3 security self-review.
+
+        Deciding and recording under the *same* lock closes that window: the policy
+        read and the audit write now happen against one consistent view of state.
+        """
+        with self._locked():
+            state = self._read_state()
+            # _decide returns (decision, rule, body) -- in that order.
+            decision_label, rule, body = self._decide(state, actor, asset)
+            allowed = decision_label == DECISION_ALLOW
+            decision = DECISION_ALLOW if allowed else DECISION_DENY
+            if request_id in state.get("events", {}):
+                self._record_duplicate(state, request_id, actor, asset)
+                self._write_state(state)
+                # A reused id is refused outright, whatever policy would have said.
+                return False, None, "request_id_reused"
+            self._record(state, request_id, actor, asset, decision, rule)
+            self._write_state(state)
+            return allowed, body, rule
 
     # ---------------------------------------------------------------- audit
     def _record(self, state: dict, request_id: str, actor: str, asset: str, decision: str, rule: str) -> str:

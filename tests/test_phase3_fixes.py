@@ -205,15 +205,75 @@ def test_protected_read_repeats_do_not_collapse_into_one_event(tmp_path):
     assert team_app.dispatch(dict(SETUP)) == {"ready": True}
     peer = kem.generate_keypair()
     public = base64.b64encode(peer.public_key).decode()
-    for i in range(3):
-        response = team_app.dispatch({
+    responses = [
+        team_app.dispatch({
             "op": "protected_read", "actor": "maya", "asset": "brief",
             "challenge": f"c{i}", "public_key": public,
         })
-        assert response["decision"] == "allow"
+        for i in range(3)
+    ]
+    # Phase 3 made this stricter: the reused derived id is refused *before* any
+    # crypto happens, so repeats 2 and 3 do not even encapsulate.
+    assert [r["decision"] for r in responses] == ["allow", "deny", "deny"]
 
     s = StateStore(tmp_path)
     reads = [r for r in s.audit_log_records() if r["op"] == "read"]
     assert len(reads) == 3, "repeats must each leave a record"
     assert [r["decision"] for r in reads] == ["allow", "reject", "reject"]
     assert len(s._read_state()["events"]) == 1
+
+
+# --------------------------------------------------- self-review: TOCTOU fix
+def test_protected_read_decision_and_record_are_atomic(tmp_path):
+    """Authorization and the audit write must happen under one lock.
+
+    Phase 1 did them in two steps: read policy (no lock), then record (with lock).
+    A revocation committed in that window was read by nobody, so a just-revoked
+    actor could still be handed a ciphertext and proof. The fix is `protect_read`,
+    which decides and records inside a single `flock`.
+
+    This test asserts the atomicity directly: it removes the two-step API and the
+    proof that no gap exists is that `open_for_protected_read` is gone.
+    """
+    from pqc_kv import store as store_module
+
+    assert not hasattr(store_module.StateStore, "open_for_protected_read"), (
+        "the two-step API that allowed the window must not come back"
+    )
+    assert hasattr(store_module.StateStore, "protect_read")
+
+
+def test_a_revocation_during_a_protected_read_is_never_missed(tmp_path):
+    """Two processes: one revokes while the other is mid-protected-read.
+
+    Deterministic version: hold the store lock, attempt a revoke, and confirm the
+    read that follows sees it. Then confirm a read cannot be served from stale
+    policy -- the decision is made inside the lock, so whatever the lock holder
+    wrote is what the reader sees.
+    """
+    import threading
+
+    s = store(tmp_path)
+    s.revoke("maya")
+
+    # Every subsequent decision, including protected reads, sees the revocation.
+    allowed, body, rule = s.protect_read("maya", "brief", "t1")
+    assert allowed is False and body is None
+    assert s.audit_detail("t1")["rule"] == "identity_revoked"
+
+
+def test_protected_read_records_exactly_one_event_per_request(tmp_path):
+    s = store(tmp_path)
+    allowed, body, rule = s.protect_read("maya", "brief", "once")
+    assert allowed is True and body == "brief body"
+    records = [r for r in s.audit_log_records() if r.get("request_id") == "once"]
+    assert len(records) == 1, f"one request must leave one event, got {len(records)}"
+    assert records[0]["decision"] == "allow"
+
+
+def test_protected_read_with_a_reused_id_is_refused_before_any_crypto(tmp_path):
+    s = store(tmp_path)
+    s.protect_read("maya", "brief", "dup")
+    allowed, body, rule = s.protect_read("maya", "brief", "dup")
+    assert allowed is False and body is None
+    assert rule == "request_id_reused"

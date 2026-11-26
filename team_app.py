@@ -143,10 +143,11 @@ def _handle_protected_read(store: StateStore, request: dict) -> dict:
         (str(actor) + str(asset)).encode("utf-8", "replace")
     ).hexdigest()[:16])
 
-    allowed, body, rule = store.open_for_protected_read(actor, asset)
+    # Authorization and the audit record happen in one locked step (TOCTOU fix):
+    # a revocation committed by another process mid-request cannot be missed.
+    allowed, body, rule = store.protect_read(actor, asset, request_id)
 
     if not allowed:
-        store.record_external(request_id, actor, asset, "deny", rule)
         # Same shape as a plain deny: no content, no reason.
         return {"decision": "deny"}
 
@@ -154,20 +155,22 @@ def _handle_protected_read(store: StateStore, request: dict) -> dict:
 
     from pqc_kv import kem
 
+    # Note: the decision is already recorded by protect_read(), atomically with the
+    # policy check. These failure paths deliberately do NOT record again -- doing so
+    # would create a second event for one request (the duplicate rule would label it
+    # `reject`), which is exactly the double-counting this project is trying to avoid.
+    # The malformed-input reasons are visible in the adapter's stderr diagnostics.
     try:
         peer_public = base64.b64decode(str(request["public_key"]).encode("ascii"), validate=True)
     except Exception:
-        store.record_external(request_id, actor, asset, "deny", "malformed_public_key")
         return {"decision": "deny"}
 
     if not isinstance(challenge, str):
-        store.record_external(request_id, actor, asset, "deny", "malformed_challenge")
         return {"decision": "deny"}
 
     try:
         encapsulation = kem.encapsulate(peer_public)
     except kem.KemError:
-        store.record_external(request_id, actor, asset, "deny", "invalid_public_key")
         return {"decision": "deny"}
 
     mac = hmac.new(
@@ -176,7 +179,6 @@ def _handle_protected_read(store: StateStore, request: dict) -> dict:
         hashlib.sha256,
     ).hexdigest()
 
-    store.record_external(request_id, actor, asset, "allow", rule)
     return {
         "decision": "allow",
         "ciphertext": base64.b64encode(encapsulation.ciphertext).decode("ascii"),
@@ -250,8 +252,16 @@ def _dispatch_keys(request: dict) -> dict:
             if not isinstance(payload, dict):
                 return {"error": "malformed_request"}
             notice = store.publish_notice(kind, payload)
+            # The publisher enforces its own notice immediately. Without this, the
+            # one node that definitely knows about the revocation is the one node
+            # that keeps honouring the old state -- found by the acceptance script.
+            from pqc_kv.keystore import b64e as _b64e
+            from pqc_kv.keystore import KeyStore as _KeyStore
+
+            pair = _KeyStore(store.root / "cluster-identity").signing_keypair("cluster-publisher")
+            applied = store.apply_notices([notice], pair.public_key)
             return {"published": True, "kind": notice["kind"], "seq": notice["seq"],
-                    "notice": notice}
+                    "applied_locally": applied["applied"], "notice": notice}
         if op == "cluster_sync":
             # Pull every notice currently in the shared outbox and apply the valid
             # ones. The outbox is a directory of *signed* blobs; trust comes from the

@@ -40,6 +40,17 @@ from pqc_kv.keystore import default_state_dir  # noqa: E402
 from pqc_kv.store import StateStore, StoreError  # noqa: E402
 
 SUPPORTED_OPS = {"setup", "read", "revoke", "audit", "protected_read"}
+# Phase 2: messaging operations are additions to, not replacements for, the five
+# contract operations. The adapter contract says the twelve goals include
+# capabilities outside its protected-resource interface, and explicitly notes that
+# end-to-end messaging, replay protection and forward secrecy need separate
+# evidence. track4_service.py stays byte-identical to the starter.
+MESSAGING_OPS = {
+    "msg_identity", "msg_directory_add", "msg_directory_show",
+    "msg_handshake_init", "msg_handshake_finish", "msg_handshake_complete",
+    "msg_handshake_confirm", "msg_send", "msg_receive", "msg_status",
+    "msg_ticket_issue", "msg_resume", "msg_close",
+}
 
 
 def _store() -> StateStore:
@@ -53,6 +64,8 @@ def _log(message: str) -> None:
 
 def dispatch(request: dict) -> dict:
     op = request.get("op")
+    if op in MESSAGING_OPS:
+        return _dispatch_messaging(request)
     if op not in SUPPORTED_OPS:
         return {"error": "unsupported_operation"}
 
@@ -151,3 +164,16 @@ def _handle_protected_read(store: StateStore, request: dict) -> dict:
         "ciphertext": base64.b64encode(encapsulation.ciphertext).decode("ascii"),
         "proof": mac,
     }
+
+
+# --------------------------------------------------------------------- Phase 2
+def _dispatch_messaging(request: dict) -> dict:
+    """Messaging operations. One generic failure; reasons stay in the audit log."""
+    try:
+        from pqc_kv.messaging import ops as messaging_ops
+
+        return messaging_ops.dispatch(request)
+    except Exception:
+        # Never surface a messaging reason code to the caller: `wrong_recipient`
+        # vs `signature_invalid` would be an oracle. One answer, like Phase 1.
+        return {"error": "request_failed"}

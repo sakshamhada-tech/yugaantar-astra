@@ -189,3 +189,27 @@ def derive_key(x_shared: bytes, pq_shared: bytes, transcript: bytes) -> bytes:
     )
     salt = hkdf_sha256(transcript, salt=b"", info=HYBRID_CONTEXT + b"/salt", length=32)
     return hkdf_sha256(ikm, salt=salt, info=HYBRID_CONTEXT + b"/key", length=KEY_LEN)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 additions: public access to the X25519 pieces the messaging handshake
+# needs. These are thin aliases over the private helpers above -- no new logic,
+# no new primitive, so Phase 1 behaviour is untouched.
+# ---------------------------------------------------------------------------
+def new_x25519_keypair() -> tuple[bytes, bytes]:
+    """(secret, public) for a fresh X25519 key. Secret form is backend-native."""
+    return _xp_new()
+
+
+def x25519_agree(secret: bytes, peer_public: bytes) -> bytes:
+    """Diffie-Hellman. Raises :class:`HybridError` for low-order or malformed keys."""
+    return _x25519_agree(secret, peer_public)
+
+
+def x25519_public_of(secret: bytes) -> bytes:
+    """Recover the public half of a stored X25519 secret (used after a restart)."""
+    family, mod = _x25519_backend()
+    if family == "cryptography":
+        return mod.X25519PrivateKey.from_private_bytes(secret).public_key().public_bytes_raw()
+    priv = mod.import_key(secret.decode("utf-8") if isinstance(secret, bytes) else secret)
+    return int(priv.pointQ.x).to_bytes(X25519_LEN, "little")

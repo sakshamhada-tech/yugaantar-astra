@@ -59,14 +59,16 @@ class Directory:
     # ------------------------------------------------------------------ read
     def _load(self) -> dict:
         if not self.path.exists():
-            return {"magic": DIRECTORY_MAGIC, "version": DIRECTORY_VERSION, "entries": {}}
+            return {"record": DIRECTORY_MAGIC, "record_version": DIRECTORY_VERSION, "entries": {}}
         try:
             data = read_key_file(self.path)
         except Exception:
             raise DirectoryError("directory unreadable") from None
-        if data.get("magic") != DIRECTORY_MAGIC:
+        # NOTE: read_key_file validates the *keystore's* magic; our own marker is a
+        # separate field so the two never clobber each other.
+        if data.get("record") != DIRECTORY_MAGIC:
             raise DirectoryError("not a directory file")
-        if data.get("version") != DIRECTORY_VERSION:
+        if data.get("record_version") != DIRECTORY_VERSION:
             raise DirectoryError("unsupported directory version")
         entries = data.get("entries")
         if not isinstance(entries, dict):

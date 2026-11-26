@@ -55,6 +55,7 @@ class FailureReason:
     INVALID_FORMAT = "invalid_format"
     UNKNOWN_SESSION = "unknown_session"
     WRONG_RECIPIENT = "wrong_recipient"
+    WRONG_SENDER = "wrong_sender"
     SIGNATURE_INVALID = "signature_invalid"
     REPLAY = "replay"
     NONCE_REUSE = "nonce_reuse"

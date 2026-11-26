@@ -81,7 +81,6 @@ def save(
     Creates the file with 0600 via the Phase 1 keystore writer (atomic + fsync),
     so a crash mid-write cannot leave a half-record that looks usable.
     """
-    prune(root)
     payload = {
         # NOTE: keystore.write_key_file stamps its own "magic"/"key_version"; our
         # own marker lives in a distinct field so neither clobbers the other.
@@ -96,13 +95,21 @@ def save(
         "mlkem_secret": b64e(mlkem_secret),
     }
     write_key_file(_path(root, handshake_id), payload)
+    # Prune *after* writing: the cap applies to the set we just grew. Pruning
+    # before each save would evict one extra record per call.
+    prune(root)
 
 
 def load(root: Path, handshake_id: str) -> dict:
     path = _path(root, handshake_id)
     if not path.exists():
         raise EphemeralError("no pending handshake")
-    data = read_key_file(path)
+    try:
+        data = read_key_file(path)
+    except Exception:
+        # keystore raises KeyStoreError for corrupt/permission problems; callers of
+        # this module must only need to handle one failure type.
+        raise EphemeralError("ephemeral record unreadable") from None
     if data.get("record") != EPHEMERAL_MAGIC or data.get("record_version") != EPHEMERAL_VERSION:
         raise EphemeralError("ephemeral record not recognised")
     try:
@@ -163,10 +170,12 @@ def prune(root: Path, keep: int = MAX_PENDING_HANDSHAKES) -> None:
     """
     directory = _dir(root)
     records = list(directory.glob("hs-*.json"))
-    if len(records) < keep:
+    if len(records) <= keep:
         return
+    # (mtime, name) keeps this deterministic: sequential ids tie-break by name,
+    # which is creation order. Being wrong costs a retried handshake, never a key.
     records.sort(key=lambda p: (p.stat().st_mtime, p.name))
-    for stale in records[: max(0, len(records) - keep + 1)]:
+    for stale in records[: len(records) - keep]:
         try:
             erase(root, stale.stem[3:])
         except EphemeralError:

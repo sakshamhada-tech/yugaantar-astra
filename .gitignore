@@ -1,0 +1,35 @@
+# Local state: keys and encrypted assets are generated at runtime, never committed.
+state/
+/.venv
+.venv/
+venv/
+
+# Private keys / sealed material would land here if state were relocated.
+*.key
+*.pem
+*.env
+!requirements*.in
+!requirements*.txt
+
+# Secrets that must never be committed
+.env
+.env.*
+secrets/
+*.secret
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

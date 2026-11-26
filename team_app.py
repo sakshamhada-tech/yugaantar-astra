@@ -52,6 +52,7 @@ SUPPORTED_OPS = {"setup", "read", "revoke", "audit", "protected_read"}
 # contract explicitly says the twelve goals include capabilities outside its
 # protected-resource interface.
 KEY_OPS = {"rotate", "key_status", "log_verify", "log_head", "recover",
+           "log_events_verify", "log_events_head",
            "cluster_publish", "cluster_sync", "cluster_status",
            "backup_create", "backup_restore"}
 # Phase 2: messaging operations are additions to, not replacements for, the five
@@ -282,6 +283,16 @@ def _dispatch_keys(request: dict) -> dict:
                 "remote_key_version": state.get("remote_key_version", 0),
                 "disabled": sorted(state.get("disabled", [])),
             }
+        if op == "log_events_verify":
+            # Operator verification of the signed key-event log. `expected_head` is
+            # the value the operator wrote down outside the state directory; without
+            # it, a truncation is invisible (a shorter valid chain is still valid).
+            expected = request.get("expected_head")
+            if expected is not None and not isinstance(expected, str):
+                return {"error": "malformed_request"}
+            return store.verify_events(expected_head=expected)
+        if op == "log_events_head":
+            return store.events_head()
         if op == "log_head":
             # Deliberately just the head digest: an operator stores this elsewhere
             # and later proves the file has not been rewritten or truncated.

@@ -54,6 +54,17 @@ class StoreError(Exception):
     """Store failure. Messages never contain plaintext, keys or key material."""
 
 
+def _safe_actor(actor) -> bool:
+    """Whether an actor name can be written to the signed event log as-is."""
+    from .logsign import LogError, validate_identifier
+
+    try:
+        validate_identifier(actor)
+    except LogError:
+        return False
+    return True
+
+
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -381,6 +392,8 @@ class StateStore:
                 state["disabled"].append(actor)
                 # Monotonic counter; the rollback check for backups compares it.
                 state["revocation_seq"] = int(state.get("revocation_seq", 0)) + 1
+                self._write_state(state)
+                self.record_event("revoke", actor if _safe_actor(actor) else "")
                 self._append_audit(state, {
                     "op": "revoke",
                     "actor": actor,
@@ -463,6 +476,9 @@ class StateStore:
             })
             intent.fault_point("after_commit")
             intent.clear(self.root)
+            # Goal 5: every rotation is a key event. Written after the commit so a
+            # crash cannot leave an event for a rotation that did not happen.
+            self.record_event("rotate", "", f"v{before}-to-v{new_entry.version}")
         return {
             "active_version": new_entry.version,
             "retiring_version": old_entry.version,
@@ -597,6 +613,7 @@ class StateStore:
                 "ts": _now(),
             })
             self._write_state(state)
+            self.record_event("restore", "", f"keys-{len(payload)}")
         return {"restored": sorted(payload), "count": len(payload)}
 
     def recovery_pending(self) -> bool:
@@ -673,6 +690,7 @@ class StateStore:
                 "op": "recover", "to_version": entry.version, "resealed": completed,
             })
             intent.clear(self.root)
+            self.record_event("recover", "", f"to-v{entry.version}")
         return {
             "recovered": True,
             "action": "completed",
@@ -838,6 +856,41 @@ class StateStore:
         state["audit_seq"] = seq
         state["audit_head"] = digest
         return digest
+
+    # ------------------------------------------------ signed key-event log (5)
+    def _event_log(self):
+        """The signed, strictly-encoded key-event log (goal 5).
+
+        Separate from `audit.jsonl` on purpose. The audit log answers "what did this
+        caller get and why"; this log answers "what happened to the keys", it is
+        signed per record, and its signer is a dedicated key so rotating the service
+        key does not invalidate the log's own signatures.
+        """
+        from . import logsign
+
+        pair = KeyStore(self.root / "log-identity").signing_keypair("eventlog")
+        return logsign.EventLog(self.root / "key-events.jsonl", pair.secret_key, pair.public_key)
+
+    def record_event(self, action: str, actor: str = "", detail: str = "") -> dict:
+        """Append a signed key event. Refuses hostile identifiers outright."""
+        from . import logsign
+
+        state = self._read_state()
+        detail = detail or f"v{int(state.get('active_version', 1))}"
+        try:
+            return self._event_log().append(action=action, actor=actor, detail=detail)
+        except logsign.LogError:
+            # Never write a record we could not validate; the caller decides what to
+            # do. The audit log still has the raw attempt.
+            raise StoreError("event rejected") from None
+
+    def verify_events(self, expected_head: str | None = None) -> dict:
+        """Full chain + signature walk, optionally against a remembered head."""
+        return self._event_log().verify(expected_head=expected_head)
+
+    def events_head(self) -> dict:
+        head, count = self._event_log().head()
+        return {"events_head": head, "events": count}
 
     def log_head(self) -> dict:
         """The current chain head, for an operator to anchor outside the state dir.

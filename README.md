@@ -1,8 +1,8 @@
 # yugaantar-astra — Trust, but verify (Track 4)
 
-#Team Name: Astra
+**Team Name: Astra**
 
-#Team Members:
+**Team Members:**
 1. Anurag Tiwari(Team Leader)
 2. Saksham Hada
 3. Shivam Kumar Gupta

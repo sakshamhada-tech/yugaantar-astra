@@ -30,7 +30,6 @@ strings we would then have to re-validate on load.
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 from ..keystore import default_state_dir, ensure_private_dir

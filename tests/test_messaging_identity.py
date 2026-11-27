@@ -6,7 +6,7 @@ import pytest
 
 from pqc_kv.keystore import KeyStore
 from pqc_kv.messaging import identity
-from pqc_kv.messaging.identity import IdentityError, PrivateIdentity, PublicIdentity
+from pqc_kv.messaging.identity import IdentityError, PublicIdentity
 
 
 @pytest.fixture()

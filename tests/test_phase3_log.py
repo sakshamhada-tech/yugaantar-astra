@@ -8,12 +8,11 @@ Two attack groups:
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 
 from pqc_kv import dsa
-from pqc_kv.keystore import KeyStore, b64e
+from pqc_kv.keystore import KeyStore
 from pqc_kv.logsign import (
     ALLOWED_ACTIONS,
     GENESIS,
@@ -290,7 +289,6 @@ def test_a_whole_file_rewrite_with_the_real_key_is_not_detectable(log):
     remembered = log.head()[0]
 
     # Rebuild the file from scratch with the real key: verifies cleanly.
-    import shutil
 
     log.path.write_text("")
     for i in range(3):
@@ -375,7 +373,7 @@ def test_every_lifecycle_action_lands_in_the_signed_log(tmp_path):
 
 def test_a_revoked_actor_with_a_hostile_name_cannot_inject_a_log_event(tmp_path):
     """The actor name flows into the log, so a bad name must not become a record."""
-    from pqc_kv.store import StateStore, StoreError
+    from pqc_kv.store import StateStore
 
     store = StateStore(tmp_path / "node")
     store.setup({"owners": {"brief": "maya"}, "contents": {"brief": "b"},

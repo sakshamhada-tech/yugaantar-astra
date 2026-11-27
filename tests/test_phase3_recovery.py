@@ -78,7 +78,8 @@ def test_the_hook_kills_a_real_process_at_the_named_point(set_up):
 
 def test_the_hook_is_not_reachable_from_adapter_input(set_up):
     """A request field must never arm the hook: env only, scrubbed at import."""
-    done = run(set_up, op="rotate", grace=2, fault_at="after_intent",
+    # leave the state mid-rotate, then prove no request field can re-arm the hook
+    run(set_up, op="rotate", grace=2, fault_at="after_intent",
                TRACK4_FAULT_AT="after_intent", fault="after_intent")
     # `fault` here is the env var name this helper sets, so it *is* armed; the point
     # is that it died from the env, not from the request fields. Prove the request

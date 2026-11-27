@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from pqc_kv import cluster, dsa
+from pqc_kv import cluster
 from pqc_kv.keystore import KeyStore, b64e
 
 ROOT = Path(__file__).resolve().parent.parent

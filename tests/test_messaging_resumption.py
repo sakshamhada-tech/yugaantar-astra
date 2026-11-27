@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 
-from pqc_kv import dsa
 from pqc_kv.keystore import KeyStore, b64e
 from pqc_kv.messaging import identity, resumption
 

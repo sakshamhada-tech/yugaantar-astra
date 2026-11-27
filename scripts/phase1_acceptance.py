@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import os
 import subprocess
 import sys
@@ -140,7 +139,6 @@ def gate_no_secrets_committed() -> None:
 
 
 def gate_no_toolkit_vendored() -> None:
-    marks = ["validate.py", "quickstart.py", "len(practice)"]  # last one never matches; placeholder
     found = [m for m in ("validate.py", "quickstart.py") if any(ROOT.rglob(m))]
     found += [str(p.relative_to(ROOT)) for p in ROOT.glob("starters")] + \
              [str(p.relative_to(ROOT)) for p in ROOT.glob("practice")]

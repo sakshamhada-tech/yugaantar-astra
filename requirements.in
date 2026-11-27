@@ -1,4 +1,0 @@
-# Direct runtime dependencies. Transitive pins live in requirements.lock.
-# Rule: only vetted, widely reviewed crypto libraries. No custom primitives.
-cryptography==46.0.4   # AES-256-GCM, HKDF-SHA256, X25519 (preferred backend)
-pqcrypto==0.4.0        # ML-KEM-768 + ML-DSA-65 (pqclean bindings; the judge's pinned version)

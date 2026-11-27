@@ -1,7 +1,7 @@
 """Dependency gate.
 
 The judging container is a read-only, offline Linux box with Python 3.12 and
-``pqcrypto==0.4.0``. It will NOT install our ``requirements.txt`` for us, and it
+``pqcrypto==0.4.0``. It will NOT install our ``requirements.lock`` for us, and it
 may or may not carry a symmetric-crypto package (``cryptography``).
 
 So we never guess: this module probes what is actually importable and exposes a

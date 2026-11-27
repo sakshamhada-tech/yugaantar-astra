@@ -121,8 +121,6 @@ def test_eval_explains_an_empty_held_out_slice(tmp_path):
     alerts. Printing `precision 0.000, F1 0.000` there invites the reader to conclude
     the detector failed, when there was nothing in the window to detect.
     """
-    import shutil
-
     toolkit = Path("/tmp/tk2/practice")
     if not toolkit.exists():
         pytest.skip("toolkit practice corpus not available")

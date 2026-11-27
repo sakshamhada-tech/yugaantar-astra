@@ -40,8 +40,6 @@ Honest limits, which SECURITY_NOTES repeats:
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import secrets
 from dataclasses import dataclass
 from pathlib import Path

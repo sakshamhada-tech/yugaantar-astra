@@ -39,7 +39,6 @@ templates/
 
 # Not needed by the runtime image
 requirements*.in
-requirements-dev.txt
 README.md
 Dockerfile
 .dockerignore

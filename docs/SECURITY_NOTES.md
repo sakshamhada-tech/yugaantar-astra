@@ -29,6 +29,18 @@ forgot; it is a boundary we are declaring.
 * One-way only: KEM gives confidentiality, not sender authenticity. Signatures
   provide that separately.
 
+**A bug found here, kept because it is the kind that survives review**
+
+The first draft of `kem.public_key_from_secret` assumed the public key sat at offset 0 of
+the ML-KEM secret key. It does not. Per FIPS 203 the secret key is laid out
+`dk_PKE (1152) || ek (1184) || H(ek) (32) || z (32)`, so the public key begins at byte
+**1152**. A test caught it; a read-through would not have, because the function *looks*
+like a slice of the right length.
+
+`_PUBLIC_KEY_OFFSET` in `kem.py` now derives the offset from the key lengths instead of
+hardcoding it, the comment states the layout, and a test pins the value. This is the
+concrete reason the project prefers a test that fails over a review that agrees.
+
 ---
 
 ## 2. `dsa.py` — ML-DSA-65 (FIPS 204)

@@ -41,11 +41,10 @@ from pathlib import Path
 
 from .. import dsa
 from ..aead import fresh_nonce
-from ..keystore import b64d, b64e
-from ..symmetric import TAG_LEN, TamperError, aesgcm_decrypt, aesgcm_encrypt
+from ..symmetric import TamperError, aesgcm_decrypt, aesgcm_encrypt
 from . import wire
 from .identity import PublicIdentity
-from .kdf import RatchetError, RatchetFailure, ReceiveRatchet, SendRatchet, derive_message_key
+from .kdf import RatchetError, RatchetFailure, ReceiveRatchet, SendRatchet
 from .session import MAX_PARTIAL_MESSAGES, PartialMessage, SessionStore
 
 DEFAULT_FRAGMENT_BYTES = wire.DEFAULT_FRAGMENT_BYTES

@@ -49,7 +49,7 @@ import tempfile
 from pathlib import Path
 
 from . import dsa
-from .keystore import b64d, b64e, ensure_private_dir, read_key_file, write_key_file, KeyStore
+from .keystore import b64d, b64e, ensure_private_dir, write_key_file, KeyStore
 
 NOTICE_MAGIC = "pqc-kv-notice"
 NOTICE_VERSION = 1

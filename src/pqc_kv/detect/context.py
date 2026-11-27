@@ -40,7 +40,8 @@ import json
 from dataclasses import dataclass, field
 
 from . import fields as F
-from .timing import AFTER, BEFORE, ORDER_CONFIRMED, UNCERTAIN
+from .timing import AFTER, BEFORE, ORDER_CONFIRMED
+from .timing import UNCERTAIN as TIMING_UNCERTAIN
 
 
 class ApprovalError(Exception):
@@ -227,6 +228,9 @@ class Match:
 
 APPROVED = "approved"
 UNAPPROVED = "unapproved"
+#: Match status: we could not decide. Distinct from ``timing.UNCERTAIN``, which is the
+#: verdict of a single clock comparison. Both spell ``"uncertain"``, so the names carry
+#: the meaning -- keep them apart when comparing.
 UNCERTAIN = "uncertain"
 
 
@@ -516,13 +520,13 @@ def _window(event, approval: Approval, timeline, config) -> tuple[str, str]:
 
     if start is not None:
         verdict = _compare_point(timeline, event.event_id, start)
-        if verdict == UNCERTAIN:
+        if verdict == TIMING_UNCERTAIN:
             return "uncertain", UNCERTAIN
         if verdict == BEFORE and not slack_before:
             return "outside", ORDER_CONFIRMED
     if until is not None:
         verdict = _compare_point(timeline, event.event_id, until)
-        if verdict == UNCERTAIN:
+        if verdict == TIMING_UNCERTAIN:
             return "uncertain", UNCERTAIN
         # ``valid_until`` is exclusive: an action at exactly the bound is out.
         if verdict == AFTER or (verdict == "same" and not slack_after):

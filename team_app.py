@@ -352,7 +352,6 @@ def _dispatch_keys(request: dict) -> dict:
             # The publisher enforces its own notice immediately. Without this, the
             # one node that definitely knows about the revocation is the one node
             # that keeps honouring the old state -- found by the acceptance script.
-            from pqc_kv.keystore import b64e as _b64e
             from pqc_kv.keystore import KeyStore as _KeyStore
 
             pair = _KeyStore(store.root / "cluster-identity").signing_keypair("cluster-publisher")

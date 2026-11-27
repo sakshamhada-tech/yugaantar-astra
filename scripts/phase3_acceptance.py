@@ -338,7 +338,6 @@ def goal5(tmp: Path) -> None:
     lines = [line for line in original.splitlines() if line.strip()]
 
     # Edit
-    import copy
 
     tampered = json.loads(lines[1])
     tampered["actor"] = "ravi"

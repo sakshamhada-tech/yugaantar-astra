@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-import pytest
 
 from pqc_kv.detect import context as ctx
 from pqc_kv.detect.config import DetectorConfig, LateralConfig

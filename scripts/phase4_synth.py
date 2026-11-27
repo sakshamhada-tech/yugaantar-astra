@@ -382,7 +382,6 @@ def scenario_expired_ticket(b: Builder, *, at: datetime, subject: str,
 def scenario_self_approval(b: Builder, *, at: datetime, subject: str,
                            approval: str) -> None:
     """Malicious: the subject approves its own change."""
-    rng = b.rng
     incident = b.new_incident("self-approval")
     start, until = _window(at)
     b.approve(
@@ -496,7 +495,6 @@ def scenario_extreme_skew(b: Builder) -> None:
 
 def scenario_hostile(b: Builder) -> None:
     """Hostile field values. These lines must be quarantined, never alerted on."""
-    rng = b.rng
     at = BASE_TIME + timedelta(days=1, hours=13)
     hostile = [
         "evil\nALERT forged",

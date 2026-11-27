@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from pqc_kv import backup, dsa
+from pqc_kv import backup
 from pqc_kv.keystore import KeyStore, b64d, b64e
 from pqc_kv.store import StateStore
 
@@ -272,7 +272,8 @@ def test_backup_and_restore_through_the_adapter(tmp_path):
 
     from pqc_kv.keystore import KeyStore as _KS
 
-    signer = _KS(state / "pqc-kv-state").signing_keypair("service")
+    # creates the service keypair on disk; the pair it returns is not under test
+    _KS(state / "pqc-kv-state").signing_keypair("service")
     ring_pair = StateStore(state).ring.dsa_pair(1)
     restored = _adapter(state, op="backup_restore", backup_key=key, backup=blob,
                         signing_public=b64e(ring_pair.public_key))

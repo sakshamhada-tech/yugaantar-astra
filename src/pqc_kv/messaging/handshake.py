@@ -48,14 +48,13 @@ Limits (in SECURITY_NOTES, repeated here so nobody has to find them):
 from __future__ import annotations
 
 import hashlib
-import json
 import secrets
 from dataclasses import dataclass
 
 from .. import dsa, hybrid, kem
 from ..keystore import b64d, b64e
 from . import ephemeral as eph_store
-from .identity import IdentityError, PrivateIdentity, PublicIdentity
+from .identity import PrivateIdentity, PublicIdentity
 from .kdf import (
     DIRECTION_INITIATOR_TO_RESPONDER,
     DIRECTION_RESPONDER_TO_INITIATOR,

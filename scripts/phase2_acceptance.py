@@ -155,7 +155,6 @@ def main() -> int:
     sys.path.insert(0, str(ROOT / "src"))
     from pqc_kv.keystore import KeyStore
     from pqc_kv.messaging import resumption
-    from pqc_kv.messaging.identity import PublicIdentity
 
     e_identity_keys = KeyStore(e_dir / "pqc-kv-messaging" / "identities")
     e_signing = e_identity_keys.signing_keypair("identity-sign-e")

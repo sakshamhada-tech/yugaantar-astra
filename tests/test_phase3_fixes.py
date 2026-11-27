@@ -169,7 +169,7 @@ def test_protected_read_proof_is_still_correct(tmp_path):
     import hmac
 
     import team_app
-    from pqc_kv import dsa, kem
+    from pqc_kv import kem
 
     import os
 
@@ -251,8 +251,6 @@ def test_a_revocation_during_a_protected_read_is_never_missed(tmp_path):
     policy -- the decision is made inside the lock, so whatever the lock holder
     wrote is what the reader sees.
     """
-    import threading
-
     s = store(tmp_path)
     s.revoke("maya")
 

@@ -6,16 +6,22 @@ measurement. Anything I could not demonstrate is marked `limit` or `not tested`
 instead of being talked up.
 
 Machine: Linux container, Python 3.11.2, `pqcrypto 0.4.0`, `cryptography 46.0.4`.
-Note the interpreter: the project targets 3.12 and CI runs 3.12, but the sandbox here
-could not install it (see `docs/PLATFORM_SUPPORT.md`). Nothing was run on macOS.
+CI also runs this suite on Python 3.12 and 3.13 and inside a linux/amd64 container (see
+`.github/workflows/verify.yml`). macOS was not used for the numbers below; the wheel
+situation there is covered in `docs/PLATFORM_SUPPORT.md`.
 
 Reproduce everything:
 
 ```sh
-python -m pytest tests -q                  # 467 passed, 1 skipped
-python scripts/phase3_acceptance.py        # 26 passed, 0 failed
+./scripts/verify_all.sh /path/to/Track-4-Toolkit   # every gate, in CI order
+
+python -m pytest tests -q                  # 834 passed, 3 skipped
+python scripts/phase3_acceptance.py        # 26/26
 python /path/to/toolkit/validate.py --entry ./track4_service.py   # 22 PASS, 0 FAIL
 ```
+
+Scope: this sheet covers **goals 1-5**. Goals 6-8 are measured in `docs/DETECTION.md`;
+goals 9-12 in `docs/SECURITY_NOTES.md` and `scripts/phase5_acceptance.py`.
 
 ---
 

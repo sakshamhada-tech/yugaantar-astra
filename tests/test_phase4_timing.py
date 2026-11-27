@@ -8,7 +8,6 @@ by corrected time and reported confidence it had not earned.
 
 from __future__ import annotations
 
-import pytest
 
 from pqc_kv.detect import timing
 from pqc_kv.detect.config import TimingConfig

@@ -185,8 +185,6 @@ class PrivilegeDetector:
             point = match.approval.valid_until_ms
             corrected = self.timeline.corrected.get(event.event_id)
             if corrected is not None:
-                from .timing import describe_gap  # local: avoid a cycle at import
-
                 gap = {
                     "approval_valid_until": point,
                     "corrected_event_ms": corrected,

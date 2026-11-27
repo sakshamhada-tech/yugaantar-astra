@@ -106,7 +106,7 @@ the suite on Apple Silicon. Do not take this document as "tested on your Mac".
 # resolves and downloads every pin for cp312 on macOS arm64, wheels only
 python3 -m pip download --no-deps --only-binary=:all: \
   --python-version 3.12 --implementation cp --abi cp312 \
-  --platform macosx_11_0_arm64 -r requirements.txt
+  --platform macosx_11_0_arm64 -r requirements.lock
 ```
 
 That is what produced the macOS column above: every pin *resolved to a wheel* for

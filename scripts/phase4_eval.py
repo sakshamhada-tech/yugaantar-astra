@@ -498,6 +498,47 @@ def seed_demo(path: Path) -> None:
     path.write_text(header + "\n".join(rows) + "\n", encoding="utf-8")
 
 
+PRACTICE_FILES = ("events.csv", "labels.csv", "approvals.json")
+
+
+def check_corpus_dir(label: str, base: Path, *, require) -> str | None:
+    """Validate a corpus directory before reading it. Returns an error, or None.
+
+    Without this the script reads whichever file it needs first and dies with a raw
+    `FileNotFoundError` for that one filename. That is useless to whoever typed the
+    path: it says a file is missing, not that the *directory* is wrong. It also does
+    not say which of the other expected files are missing, and it looks like a code
+    failure rather than a mistyped argument.
+
+    The specific path that produced this: the phase 4 eval was run with
+    `--practice /toolkit/practice`, which is the mount point *inside the Docker
+    container*. Natively on macOS that path does not exist, and the traceback sent
+    someone looking for a bug in the detector.
+    """
+    if not base.exists():
+        return (
+            f"--{label} path does not exist: {base}\n"
+            f"    That directory is not on this machine. Note that /toolkit is the "
+            f"mount point used *inside* the Docker container, not a host path.\n"
+            f"    Natively, clone the toolkit and point at it directly:\n"
+            f"      git clone --depth 1 "
+            f"https://github.com/ScalerOpenSourceLabs/Track-4-Toolkit.git ../Track-4-Toolkit\n"
+            f"      python scripts/phase4_eval.py --practice ../Track-4-Toolkit/practice"
+        )
+    if not base.is_dir():
+        return f"--{label} path is not a directory: {base}"
+    missing = [name for name in require if not (base / name).exists()]
+    if missing:
+        found = sorted(p.name for p in base.iterdir())[:12]
+        return (
+            f"--{label} directory is missing {missing}: {base}\n"
+            f"    It contains: {found}\n"
+            f"    For the toolkit's corpus, point at the `practice` directory itself "
+            f"(it holds events.csv, labels.csv and approvals.json)."
+        )
+    return None
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Phase 4 detector evaluation")
     parser.add_argument("--practice", type=Path, default=None,
@@ -508,6 +549,22 @@ def main(argv=None) -> int:
     parser.add_argument("--timing", type=Path, default=None,
                         help="measure throughput on this large log instead")
     args = parser.parse_args(argv)
+
+    # Fail before doing any work, with a message about the argument rather than a
+    # traceback from inside a reader.
+    if args.practice:
+        problem = check_corpus_dir("practice", args.practice, require=PRACTICE_FILES)
+        if problem:
+            print(f"error: {problem}", file=sys.stderr)
+            return 2
+    if args.synthetic:
+        problem = check_corpus_dir("synthetic", args.synthetic, require=PRACTICE_FILES)
+        if problem:
+            print(f"error: {problem}", file=sys.stderr)
+            return 2
+    if args.timing and not args.timing.exists():
+        print(f"error: --timing log does not exist: {args.timing}", file=sys.stderr)
+        return 2
 
     results = []
     if args.practice:
@@ -592,6 +649,16 @@ def _print_summary(label: str, summary: dict) -> None:
     print(f"    false alerts per 1000 benign events: "
           f"{summary['false_alerts_per_1000_benign']:.2f} "
           f"({summary['benign_events']} benign)")
+    if summary["incidents"] == 0:
+        # An empty slice: recall is 0/0, which the metrics library reports as 0.000.
+        # Printing that next to "precision 0.000 / F1 0.000" reads like a detector that
+        # found nothing, when the truth is that this window contains nothing to find.
+        # The practice corpus shows it: its only incidents are in the earlier half, so
+        # the held-out window legitimately contains zero incidents and zero alerts.
+        print("    NOTE: this slice contains 0 labelled incidents, so recall and F1 "
+              "are undefined here")
+        print("          and printed as 0.000. It is not a miss -- there was nothing "
+              "in this window to catch.")
     median = summary["median_time_to_alert_ms"]
     print(f"    median time to alert (event time, alert vs first malicious "
           f"event): {median if median is not None else 'n/a'}"

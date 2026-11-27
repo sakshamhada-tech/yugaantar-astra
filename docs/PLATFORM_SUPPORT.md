@@ -55,6 +55,14 @@ That is the whole of it. Concretely it imposes four things on us:
 | Read-only root filesystem | no writes outside the state dir; verified by bind-mounting the code dir read-only |
 | State in a temp path; `TRACK4_STATE_DIR` when set, else OS temp | `keystore.default_state_dir()`; the image deliberately does **not** set the variable, so the default command exercises the fallback path |
 
+**Correction (verified 2026-11-26 against the PyPI JSON API):** an earlier version of
+this document claimed `pqcrypto` ships **no** macOS arm64 wheel and that Apple Silicon
+users needed Docker with `--platform linux/amd64`. That was wrong. Release 0.4.0
+publishes seven macOS arm64 wheels (`cp39` through `cp314`), including
+`pqcrypto-0.4.0-cp312-cp312-macosx_11_0_arm64.whl`. Native install on Apple Silicon
+works; Docker is a convenience for reproducing the judge's linux/amd64 runtime, not a
+requirement.
+
 Notably, the document says **nothing about macOS**, and nothing about arm64 vs
 amd64. Cross-platform support is therefore *our* requirement, and the only real
 risk is dependency availability — which is exactly what the table below measures.

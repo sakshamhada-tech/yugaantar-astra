@@ -211,7 +211,19 @@ def main() -> int:
     args = parser.parse_args()
     toolkit = args.toolkit.resolve() if args.toolkit else None
     if toolkit and not (toolkit / "validate.py").exists():
-        print(f"warning: {toolkit} does not look like the toolkit; validator gate will fail")
+        # Refuse rather than warn. Carrying on ran three dependent gates against a
+        # directory that cannot work, and printed "PHASE 1 IS NOT VERIFIED. Fix the
+        # failures above" -- which reads as a security regression when the actual
+        # problem is a mistyped path.
+        print(f"error: --toolkit is not a toolkit checkout: {toolkit}", file=sys.stderr)
+        print(f"    Expected {toolkit / 'validate.py'} to exist.", file=sys.stderr)
+        print("    Clone it and point at the checkout root, not at a file inside it:\n"
+              "      git clone --depth 1 "
+              "https://github.com/ScalerOpenSourceLabs/Track-4-Toolkit.git "
+              "../Track-4-Toolkit\n"
+              "      python scripts/phase1_acceptance.py --toolkit ../Track-4-Toolkit",
+              file=sys.stderr)
+        return 2
 
     print("=" * 74)
     print("Phase 1 acceptance gate — each line is a check that actually ran")

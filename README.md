@@ -1,5 +1,12 @@
 # yugaantar-astra — Trust, but verify (Track 4)
 
+#Team Name: Astra
+
+#Team Members:
+1. Anurag Tiwari(Team Leader)
+2. Saksham Hada
+3. Shivam Kumar Gupta
+
 Post-quantum, zero-trust access control for protected files. An owner reads a protected
 synthetic file; after revocation the same owner is denied, a second owner still reads their
 own file, and an audit record explains the denial.

@@ -110,3 +110,26 @@ def test_the_guard_only_applies_when_a_toolkit_is_given():
     assert done.returncode == 0, done.stdout + done.stderr
     assert "--toolkit" in done.stdout
     assert "Traceback" not in done.stdout + done.stderr
+
+
+# ------------------------------------- an empty evaluation slice must say so
+def test_eval_explains_an_empty_held_out_slice(tmp_path):
+    """`0/0 incidents -> F1 0.000` reads as a miss. It is an undefined slice.
+
+    The practice corpus triggers this: all five of its incidents are in the earlier
+    half of event time, so the held-out window contains zero incidents and zero
+    alerts. Printing `precision 0.000, F1 0.000` there invites the reader to conclude
+    the detector failed, when there was nothing in the window to detect.
+    """
+    import shutil
+
+    toolkit = Path("/tmp/tk2/practice")
+    if not toolkit.exists():
+        pytest.skip("toolkit practice corpus not available")
+
+    done = run("phase4_eval.py", "--practice", str(toolkit))
+    assert done.returncode == 0, done.stdout + done.stderr
+    out = done.stdout
+    assert "0/0 incidents" in out, "expected the empty-slice case in this corpus"
+    assert "0 labelled incidents" in out
+    assert "not a miss" in out

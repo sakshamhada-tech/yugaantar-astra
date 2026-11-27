@@ -649,6 +649,17 @@ def _print_summary(label: str, summary: dict) -> None:
     print(f"    false alerts per 1000 benign events: "
           f"{summary['false_alerts_per_1000_benign']:.2f} "
           f"({summary['benign_events']} benign)")
+    if summary["incidents"] == 0:
+        # An empty slice: recall is 0/0, which the metrics library reports as 0.000.
+        # Printing that next to "precision 0.000 / F1 0.000" reads like a detector that
+        # found nothing, when the truth is that this window contains nothing to find.
+        # The practice corpus shows it: its only incidents are in the earlier half, so
+        # the held-out window legitimately contains zero incidents and zero alerts.
+        print("    NOTE: this slice contains 0 labelled incidents, so recall and F1 "
+              "are undefined here")
+        print("          and printed as 0.000. It is not a miss -- there was nothing "
+              "in this window to catch.")
+    median = summary["median_time_to_alert_ms"]
     print(f"    median time to alert (event time, alert vs first malicious "
           f"event): {median if median is not None else 'n/a'}"
           + (" ms" if median is not None else ""))

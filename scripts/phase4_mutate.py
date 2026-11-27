@@ -229,6 +229,23 @@ def main(argv=None) -> int:
     parser.add_argument("--json", type=Path, default=None)
     args = parser.parse_args(argv)
 
+    # A missing corpus is an argument error, not a measurement. Without this check the
+    # error is swallowed by the mutation harness and reported as
+    # `metrics: {'error': ...}`, which reads as "the detector found nothing" -- the
+    # opposite of the truth -- and lets every mutation appear to succeed.
+    missing = [str(p) for p in (args.log, args.approvals) if str(p) and not p.exists()]
+    if missing:
+        print(f"error: corpus file(s) not found: {missing}", file=sys.stderr)
+        print("    /toolkit is a Docker mount point, not a host path. Natively:\n"
+              "      git clone --depth 1 "
+              "https://github.com/ScalerOpenSourceLabs/Track-4-Toolkit.git "
+              "../Track-4-Toolkit\n"
+              "      python scripts/phase4_mutate.py "
+              "--log ../Track-4-Toolkit/practice/events.csv \\\n"
+              "        --approvals ../Track-4-Toolkit/practice/approvals.json --tests",
+              file=sys.stderr)
+        return 2
+
     baseline = run_metrics("baseline", "pass", args.log, args.approvals)
     print(f"baseline: {baseline}")
     output = {"baseline": baseline, "mutations": {}}
